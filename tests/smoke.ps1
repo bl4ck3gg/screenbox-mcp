@@ -73,3 +73,5 @@ if ($IsWindows) {
 }
 
 Write-Host "`nALL PASS" -ForegroundColor Green
+
+exit 0
