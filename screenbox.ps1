@@ -78,6 +78,8 @@ public static extern IntPtr SendMessageInt(IntPtr hWnd, uint Msg, IntPtr wParam,
 [System.Runtime.InteropServices.DllImport("user32.dll")]
 public static extern bool SetForegroundWindow(IntPtr hWnd);
 [System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
 public static extern IntPtr GetForegroundWindow();
 [System.Runtime.InteropServices.DllImport("user32.dll")]
 public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
@@ -289,10 +291,45 @@ function Get-WindowOf($el) {
     return $cur
 }
 
+function Get-WindowTextDigest($win) {
+    # THE FIFTH READING, and the one a calculator exposed. Pressing a digit button
+    # changes NO structure: the button count is identical, the window count is
+    # identical, the button's own name is empty before and after. The only thing that
+    # changes is the display control sitting next to it. A fingerprint built from
+    # counts alone reports "nothing happened" for an action that plainly worked, and
+    # a caller that trusts it retries - turning "7" into "77".
+    #
+    # So summarise the TEXT of the window's elements too. A digest, not the text
+    # itself: this runs twice per action and the point is to detect change, not to
+    # report content (screen_inspect does that).
+    if (-not $win) { return '' }
+    $sb = New-Object System.Text.StringBuilder
+    $n = 0
+    try {
+        foreach ($e in $win.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) {
+            if ($n -ge 120) { break }
+            try {
+                $c = $e.Current
+                if ($c.IsOffscreen) { continue }
+                $nm = $c.Name
+                if ($nm) { [void]$sb.Append($nm); [void]$sb.Append([char]31) }
+                $n++
+            } catch { }
+        }
+    } catch { }
+    $bytes = [System.Text.Encoding]::Unicode.GetBytes($sb.ToString())
+    $sha = [System.Security.Cryptography.SHA1]::Create()
+    try {
+        return [System.BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').Substring(0, 16)
+    } finally { $sha.Dispose() }
+}
+
 function Get-Fingerprint($el) {
-    # THREE READINGS, because an action's effect can land in three places:
-    # the target itself, the window's subtree (a new tab or row), or the desktop
-    # (a new dialog). Reporting only the first is what makes "verified" wrong.
+    # FOUR READINGS, because an action's effect can land in four places:
+    # the target itself, the window's subtree (a new tab or row), the desktop
+    # (a new dialog), or the TEXT of another control in the same window (a display
+    # that now reads "7"). Reporting only the first three is what makes "verified"
+    # wrong on any Win32 dialog whose buttons change a label.
     $sub = Count-Subtree $el $SubtreeCap
     $win = Get-WindowOf $el
     $winSub = Count-Subtree $win $SubtreeCap
@@ -303,6 +340,7 @@ function Get-Fingerprint($el) {
         targetKids   = @{ count = $sub.count; capped = $sub.capped }
         windowKids   = @{ count = $winSub.count; capped = $winSub.capped }
         topWindows   = [int]$tops
+        windowText   = Get-WindowTextDigest $win
     }
 }
 
@@ -321,6 +359,11 @@ function Compare-Fingerprint($before, $after) {
     }
     if ($before.topWindows -ne $after.topWindows) {
         $changed += "topWindows=$($before.topWindows) -> $($after.topWindows)"
+    }
+    if ($before.windowText -ne $after.windowText) {
+        # Deliberately terse: the digest is not the content. What matters is that
+        # something in the window's text changed, which means the action had an effect.
+        $changed += "windowText changed ($($before.windowText) -> $($after.windowText))"
     }
     return $changed
 }
@@ -584,9 +627,22 @@ function Tool-Act($ta) {
         }
         '^window:maximize$' { $el.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).SetWindowVisualState('Maximized'); $did = 'WindowPattern.Maximize' }
         '^window:minimize$' { $el.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).SetWindowVisualState('Minimized'); $did = 'WindowPattern.Minimize' }
+        '^window:activate$' {
+            # Bring the window to the foreground so the human looking at the screen
+            # sees it. Win32 SetForegroundWindow is the primary; if the element is not
+            # a window, find the containing top-level window and foreground that.
+            $targetWin = Get-WindowOf $el
+            $targetH = [IntPtr]::Zero
+            if ($targetWin) { $targetH = [IntPtr]$targetWin.Current.NativeWindowHandle }
+            if ($targetH -eq [IntPtr]::Zero) { $targetH = $h }
+            if ($targetH -eq [IntPtr]::Zero) { throw 'neither this element nor its container has an HWND to foreground' }
+            [Screenbox.Win32Edit]::ShowWindow($targetH, 9) | Out-Null
+            $r = [Screenbox.Win32Edit]::SetForegroundWindow($targetH)
+            $did = "SetForegroundWindow + ShowWindow(SW_RESTORE) returned $r"
+        }
         '^window:close$'    { $el.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).Close(); $did = 'WindowPattern.Close' }
         default {
-            throw "unknown action '$action'. Known: invoke, default, click, toggle, expand, collapse, select, focus, setvalue:<text>, window:maximize, window:minimize, window:close"
+            throw "unknown action '$action'. Known: invoke, default, click, toggle, expand, collapse, select, focus, setvalue:<text>, window:maximize, window:minimize, window:close, window:activate"
         }
     }
 
@@ -875,6 +931,89 @@ function Tool-List($ta) {
     }
 }
 
+function Tool-Launch($ta) {
+    Assert-Uia
+    # THE GAP THIS FILLS. Every other Layer-1 tool acts on something that already
+    # exists. Starting a program had no tool, so it went through a scheduled task
+    # every time - and a scheduled task registered the obvious way (cmd /c start)
+    # pops a console window onto the person's desktop, because Windows Terminal is
+    # the default console host. Two consequences, both real: the desktop gets filled
+    # with windows nobody asked for, and each launch was a hand-written script.
+    #
+    # The fix is to run the program DIRECTLY (no cmd, no powershell wrapper), under
+    # the same principal the accessibility bridge uses, because that principal is the
+    # one logged into the interactive session. A GUI program then draws its own window
+    # and nothing else appears.
+    $path = if ($ta.PSObject.Properties['path']) { [string]$ta.path } else { '' }
+    if (-not $path) { throw 'screen_launch needs path' }
+    if (-not (Test-Path -LiteralPath $path)) { throw "no such file: $path" }
+    $argStr  = if ($ta.PSObject.Properties['args'])    { [string]$ta.args } else { '' }
+    $timeout = if ($ta.PSObject.Properties['timeout']) { [double]$ta.timeout } else { 8.0 }
+
+    $before = @{}
+    foreach ($w in $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)) {
+        try { $before[[int64]$w.Current.NativeWindowHandle] = $true } catch { }
+    }
+    $beforeCount = $before.Count
+
+    $template = Get-ScheduledTask -TaskName 'uiaws' -ErrorAction SilentlyContinue
+    if (-not $template) {
+        throw 'the accessibility bridge task (uiaws) is not registered, so there is no known principal that owns the interactive session. screen_launch will not guess: a process started under the wrong principal lands in session 0 and draws no window at all.'
+    }
+    $taskName = 'screenbox-launch-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+
+    $action = if ($argStr) {
+        New-ScheduledTaskAction -Execute $path -Argument $argStr
+    } else {
+        New-ScheduledTaskAction -Execute $path
+    }
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+    Register-ScheduledTask -TaskName $taskName -Action $action -Principal $template.Principal -Settings $settings -Force | Out-Null
+
+    $started = Get-Date
+    try {
+        Start-ScheduledTask -TaskName $taskName
+    } finally {
+        # Unregister quickly: the task has done its job once the process exists, and a
+        # leftover task is the same clutter as a leftover window.
+        Start-Sleep -Milliseconds 600
+        try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false } catch { }
+    }
+
+    $deadline = $started.AddSeconds($timeout)
+    $new = @()
+    while ((Get-Date) -lt $deadline) {
+        $new = @()
+        foreach ($w in $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)) {
+            try {
+                $h = [int64]$w.Current.NativeWindowHandle
+                if ($h -ne 0 -and -not $before.ContainsKey($h)) { $new += $w }
+            } catch { }
+        }
+        if ($new.Count -gt 0) { break }
+        Start-Sleep -Milliseconds 200
+    }
+
+    $windows = @()
+    foreach ($w in $new) { $windows += Get-Brief $w }
+    $ms = [int]((Get-Date) - $started).TotalMilliseconds
+
+    return [ordered]@{
+        launched       = $true
+        path           = $path
+        args           = $argStr
+        waited_ms      = $ms
+        newWindows     = $windows
+        windowsBefore  = $beforeCount
+        windowsAfter   = $beforeCount + $windows.Count
+        note           = if ($windows.Count -eq 0) {
+            'the program was started under the interactive session but no new top-level window appeared within the timeout. It may still be starting, it may be a console program, or it may have exited. screen_windows will show it if it is there.'
+        } else {
+            'each newWindows entry is a window that did not exist before the launch.'
+        }
+    }
+}
+
 function Tool-Wait($ta) {
     Assert-Uia
     # THE THIRD LAYER: an action plus the observation that confirms it, in one call.
@@ -1030,6 +1169,12 @@ $Tools = @(
             type    = @{ type = 'string' }
             procId  = @{ type = 'integer' }
             under   = @{ type = 'string'; description = 'a ref to search inside' } } } }
+    @{ name = 'screen_launch'
+       desc = 'Start a program in the interactive desktop session and report the windows it created. This is the only way to reach a program that is not running yet: a process started some other way lands in session 0 and draws no window, which reads back as an empty accessibility tree rather than an error. Runs the executable directly (no shell wrapper), so no console window appears. Give the full path.'
+       schema = @{ type = 'object'; properties = @{
+            path    = @{ type = 'string'; description = 'full path to the executable' }
+            args    = @{ type = 'string'; description = 'command line arguments, optional' }
+            timeout = @{ type = 'number'; description = 'seconds to wait for a window to appear (default 8)' } }; required = @('path') } }
     @{ name = 'screen_type'
        desc = 'Type literal text into the focused element via SendKeys (reaches menus and dialogs that expose no pattern), then report the focused element fingerprint before and after.'
        schema = @{ type = 'object'; properties = @{ text = @{ type = 'string' } }; required = @('text') } }
@@ -1045,6 +1190,7 @@ function Invoke-Tool([string]$name, $ta) {
         'screen_keys'     { return Tool-Keys $ta }
         'screen_list'     { return Tool-List $ta }
         'screen_wait'     { return Tool-Wait $ta }
+        'screen_launch'   { return Tool-Launch $ta }
         'screen_type'    { return Tool-Type $ta }
         default { throw "unknown tool '$name'" }
     }
@@ -1080,7 +1226,7 @@ if ($SelfTest) {
             if (-not $w) { $results += @{ tool = $name; ok = $true; bytes = 0; sample = 'skipped: no window' }; continue }
             $args = [pscustomobject]@{ ref = (Get-RefFor $w) }
         }
-        if ($name -in @('screen_type','screen_keys','screen_list','screen_wait')) { continue }
+        if ($name -in @('screen_type','screen_keys','screen_list','screen_wait','screen_launch')) { continue }
         if ($name -eq 'screen_find') { $args = [pscustomobject]@{ cls = 'Shell_TrayWnd' } }
         if ($name -eq 'screen_act') {
             # NOT the first window: the taskbar and Program Manager are top-level
