@@ -535,9 +535,26 @@ function Tool-Find($ta) {
 
 function Tool-Act($ta) {
     Assert-Uia
-    $ref = if ($ta.PSObject.Properties['ref'])    { [string]$ta.ref } else { '' }
+    # BRIDGING OCR TO ACT. screen_ocr returns x/y coordinates because pixels do not have
+    # refs. If a caller passes x and y without a ref, use AutomationElement.FromPoint to
+    # resolve the control under the cursor. That turns pure visual coordinates into a real
+    # UIA element so all fingerprinting, window tracking and verification still apply.
+    $ref = if ($ta.PSObject.Properties['ref'])       { [string]$ta.ref } else { '' }
     $action = if ($ta.PSObject.Properties['action']) { [string]$ta.action } else { '' }
-    $el = Resolve-Ref $ref
+    if (-not $action) { throw 'screen_act needs an action' }
+
+    $el = $null
+    if ($ref) {
+        $el = Resolve-Ref $ref
+    } elseif ($ta.PSObject.Properties['x'] -and $ta.PSObject.Properties['y']) {
+        $px = [int]$ta.x; $py = [int]$ta.y
+        $pt = New-Object System.Windows.Point($px, $py)
+        try { $el = [System.Windows.Automation.AutomationElement]::FromPoint($pt) } catch { }
+        if (-not $el) { throw "no element at screen coordinates ($px,$py)" }
+        $ref = Get-RefFor $el
+    } else {
+        throw 'screen_act needs either ref (from screen_find / screen_windows) or x/y coordinates (from screen_ocr)'
+    }
     $before = Get-Fingerprint $el
     $did = ''
 
@@ -1107,6 +1124,281 @@ function Tool-Launch($ta) {
     }
 }
 
+# ---------------------------------------------------------------------------
+# OCR: the visual fallback for what accessibility cannot see
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS. Owner-draw controls store no text (measured: calculator buttons
+# report an empty Name AND an empty WM_GETTEXT), so every text-based selector misses
+# them and only raw geometry remains - which breaks the moment the layout changes.
+# Windows ships an offline OCR engine, so the pixels themselves carry the text.
+#
+# THREE THINGS PS 5.1 MAKES HARD, all discovered by measurement:
+#   1. A WinRT type is not findable by name; it needs the assembly and
+#      ContentType=WindowsRuntime, and instances come from [Activator], not New-Object.
+#   2. WinRT async returns IAsyncOperation, which PowerShell cannot await. The
+#      AsTask<T> extension in System.Runtime.WindowsRuntime is the bridge, reached
+#      through reflection because T is only known at runtime.
+#   3. .Lines / .Words are WinRT projected collections; @(...) is required or Count
+#      enumerates element-wise and the value becomes an array.
+$script:OcrReady = $false
+
+function Initialize-Ocr {
+    if ($script:OcrReady) { return }
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    Add-Type -AssemblyName System.Drawing
+    Add-Type -AssemblyName System.Windows.Forms
+    $script:AsTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+        $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+        $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+    })[0]
+    if (-not $script:AsTask) {
+        throw 'System.Runtime.WindowsRuntime did not expose AsTask(IAsyncOperation<T>); WinRT async cannot be awaited without it'
+    }
+    $script:OcrReady = $true
+}
+
+function Await-WinRT($op, [Type]$type) {
+    $m = $script:AsTask.MakeGenericMethod($type)
+    $task = $m.Invoke($null, @($op))
+    if (-not $task.Wait(20000)) { throw "WinRT operation did not complete within 20 s ($($type.Name))" }
+    return $task.Result
+}
+
+function Get-ScreenBitmap([int]$x, [int]$y, [int]$w, [int]$h) {
+    $bmp = New-Object System.Drawing.Bitmap($w, $h)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    try { $g.CopyFromScreen($x, $y, 0, 0, (New-Object System.Drawing.Size($w, $h))) }
+    finally { $g.Dispose() }
+    return $bmp
+}
+
+function ConvertTo-SoftwareBitmap($bmp) {
+    $ms = New-Object System.IO.MemoryStream
+    try {
+        $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Bmp)
+        $bytes = $ms.ToArray()
+    } finally { $ms.Dispose() }
+
+    $rasType = [Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
+    $ras = [System.Activator]::CreateInstance($rasType)
+    $dwType = [Windows.Storage.Streams.DataWriter, Windows.Storage.Streams, ContentType = WindowsRuntime]
+    $dw = [System.Activator]::CreateInstance($dwType, @($ras))
+    $dw.WriteBytes($bytes)
+    $storeOp = $dw.StoreAsync()
+    Await-WinRT $storeOp ([uint32]) | Out-Null
+    $dw.DetachStream() | Out-Null
+    $ras.Seek(0)
+
+    $decoderType = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
+    $decoder = Await-WinRT ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($ras)) $decoderType
+    $sbType = [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
+    return Await-WinRT ($decoder.GetSoftwareBitmapAsync()) $sbType
+}
+
+function Tool-Shot($ta) {
+    # SEEING IS NOT A LUXURY. Every conclusion this server draws has so far come from
+    # rectangles and property values, and when OCR returned nothing for a calculator
+    # there was no way to tell whether the window was covered, whether the text was too
+    # small, or whether the capture was empty. A picture answers all three at once, and
+    # it is the only honest way to check that a region contains what you think.
+    Initialize-Ocr
+
+    $wx = $null; $wy = $null; $ww = $null; $wh = $null
+    if ($ta.PSObject.Properties['ref'] -and $ta.ref) {
+        $el = Resolve-Ref ([string]$ta.ref)
+        $r = $el.Current.BoundingRectangle
+        $wx = [int]$r.X; $wy = [int]$r.Y; $ww = [int]$r.Width; $wh = [int]$r.Height
+        if ($ww -le 0 -or $wh -le 0) { throw "ref '$($ta.ref)' has an empty rectangle" }
+    } else {
+        $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+        $wx = $bounds.X; $wy = $bounds.Y; $ww = $bounds.Width; $wh = $bounds.Height
+    }
+    if ($ta.PSObject.Properties['x']) { $wx = [int]$ta.x }
+    if ($ta.PSObject.Properties['y']) { $wy = [int]$ta.y }
+    if ($ta.PSObject.Properties['w']) { $ww = [int]$ta.w }
+    if ($ta.PSObject.Properties['h']) { $wh = [int]$ta.h }
+    if ($ww -le 0 -or $wh -le 0) { throw "region is empty: ${ww}x${wh}" }
+
+    $up = if ($ta.PSObject.Properties['scale']) { [double]$ta.scale } else { 1.0 }
+    if ($up -lt 0.1) { $up = 1.0 }
+
+    $bmp = Get-ScreenBitmap $wx $wy $ww $wh
+    $outBmp = $bmp
+    try {
+        if ($up -ne 1.0) {
+            # Upscaling before saving is worth a flag because the OCR engine loses very
+            # small text: an 8 pt digit in a 34x27 button is near the recognizer's floor.
+            $nw = [int]($ww * $up); $nh = [int]($wh * $up)
+            $outBmp = New-Object System.Drawing.Bitmap($nw, $nh)
+            $g2 = [System.Drawing.Graphics]::FromImage($outBmp)
+            try {
+                $g2.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                $g2.DrawImage($bmp, 0, 0, $nw, $nh)
+            } finally { $g2.Dispose() }
+        }
+
+        $path = if ($ta.PSObject.Properties['path']) { [string]$ta.path } else { 'C:/tc/screenbox/shot.png' }
+        $dir = [System.IO.Path]::GetDirectoryName($path)
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $outBmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+
+        # Brightness is the cheapest possible "is anything there" check, and it is the
+        # one that would have explained a black capture immediately.
+        $sample = 0.0; $n = 0
+        $stepX = [Math]::Max(1, [int]($outBmp.Width / 40)); $stepY = [Math]::Max(1, [int]($outBmp.Height / 40))
+        for ($yy = 0; $yy -lt $outBmp.Height; $yy += $stepY) {
+            for ($xx = 0; $xx -lt $outBmp.Width; $xx += $stepX) {
+                $px = $outBmp.GetPixel($xx, $yy)
+                $sample += ($px.R + $px.G + $px.B) / 3.0; $n++
+            }
+        }
+        $avg = if ($n -gt 0) { [int]($sample / $n) } else { -1 }
+
+        return [ordered]@{
+            path          = $path
+            region        = [ordered]@{ x = $wx; y = $wy; w = $ww; h = $wh }
+            image         = [ordered]@{ w = $outBmp.Width; h = $outBmp.Height; scale = $up }
+            averageBrightness = $avg
+            note          = 'brightness 0 means the capture is black: the session is locked, or the region is outside the rendered desktop. Read the PNG to see what is actually there instead of inferring it from rectangles.'
+        }
+    } finally {
+        if ($outBmp -ne $bmp) { $outBmp.Dispose() }
+        $bmp.Dispose()
+    }
+}
+
+function Tool-Ocr($ta) {
+    Initialize-Ocr
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    # REGION: a ref limits the work to that element, which is both faster and more
+    # accurate (the engine has less text to disambiguate). Explicit x/y/w/h wins.
+    $wx = $null; $wy = $null; $ww = $null; $wh = $null
+    if ($ta.PSObject.Properties['ref'] -and $ta.ref) {
+        $el = Resolve-Ref ([string]$ta.ref)
+        $r = $el.Current.BoundingRectangle
+        $wx = [int]$r.X; $wy = [int]$r.Y; $ww = [int]$r.Width; $wh = [int]$r.Height
+        if ($ww -le 0 -or $wh -le 0) { throw "ref '$($ta.ref)' has an empty rectangle; nothing to look at" }
+    } else {
+        $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+        $wx = $bounds.X; $wy = $bounds.Y; $ww = $bounds.Width; $wh = $bounds.Height
+    }
+    if ($ta.PSObject.Properties['x']) { $wx = [int]$ta.x }
+    if ($ta.PSObject.Properties['y']) { $wy = [int]$ta.y }
+    if ($ta.PSObject.Properties['w']) { $ww = [int]$ta.w }
+    if ($ta.PSObject.Properties['h']) { $wh = [int]$ta.h }
+    if ($ww -le 0 -or $wh -le 0) { throw "region is empty: ${ww}x${wh}" }
+
+    $langTag = if ($ta.PSObject.Properties['lang']) { [string]$ta.lang } else { '' }
+    $langType = [Windows.Globalization.Language, Windows.Globalization, ContentType = WindowsRuntime]
+    $engineType = [Windows.Media.Ocr.OcrEngine, Windows.Media.Ocr, ContentType = WindowsRuntime]
+    $engine = $null
+    if ($langTag) {
+        $engine = $engineType::TryCreateFromLanguage([System.Activator]::CreateInstance($langType, @($langTag)))
+        if (-not $engine) { throw "no OCR engine for language '$langTag'" }
+    } else {
+        # THE CULTURE A SERVICE-STARTED PROCESS SEES IS NOT THE DESKTOP'S CULTURE.
+        # A powershell launched by node from a scheduled task reports en-US for
+        # CurrentUICulture on a Chinese machine, because that is the service profile's
+        # culture rather than the interactive user's. Measured here: CurrentUICulture
+        # said en-US while the calculator's own UI was Chinese, and OCR returned 0 lines;
+        # forcing zh-Hans-CN returned 4 lines including the title and a digit.
+        #
+        # The registry holds the machine's real UI language. Read it, then fall back to
+        # the recognizer languages Windows actually reports as installed.
+        $uiLang = ''
+        try { $uiLang = [string](Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language' -ErrorAction Stop).InstallLanguage } catch { }
+        $nlsDefault = ''
+        try { $nlsDefault = [string](Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language' -ErrorAction Stop).Default } catch { }
+
+        $candidates = @()
+        if ($uiLang -match '0804' -or $nlsDefault -match '0804') { $candidates += 'zh-Hans-CN' }
+        if ($uiLang -match '0404' -or $nlsDefault -match '0404') { $candidates += 'zh-Hant-TW' }
+        foreach ($inst in @($engineType::AvailableRecognizerLanguages)) {
+            $tag = [string]$inst.LanguageTag
+            if ($candidates -notcontains $tag) { $candidates += $tag }
+        }
+        if ($candidates.Count -eq 0) { throw 'this Windows has no OCR recognizer language installed' }
+
+        foreach ($c in $candidates) {
+            try {
+                $engine = $engineType::TryCreateFromLanguage([System.Activator]::CreateInstance($langType, @($c)))
+                if ($engine) { break }
+            } catch { }
+        }
+        if (-not $engine) { $engine = $engineType::TryCreateFromUserProfileLanguages() }
+    }
+    if (-not $engine) { throw 'could not create an OCR engine: no recognizer language matched' }
+
+    # DEFAULT 2x. Control text is often 8-9 pt, which sits at the recognizer's floor:
+    # at 1x the calculator's buttons yielded nothing while its title and menu came
+    # through. Doubling costs about 100 ms and makes the small text legible.
+    $up = if ($ta.PSObject.Properties['scale']) { [double]$ta.scale } else { 2.0 }
+    if ($up -lt 0.5) { $up = 1.0 }
+
+    $raw = Get-ScreenBitmap $wx $wy $ww $wh
+    $bmp = $raw
+    if ($up -ne 1.0) {
+        $bmp = New-Object System.Drawing.Bitmap([int]($ww * $up), [int]($wh * $up))
+        $g3 = [System.Drawing.Graphics]::FromImage($bmp)
+        try {
+            $g3.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $g3.DrawImage($raw, 0, 0, $bmp.Width, $bmp.Height)
+        } finally { $g3.Dispose(); $raw.Dispose() }
+    }
+    try {
+        $sb = ConvertTo-SoftwareBitmap $bmp
+    } finally { $bmp.Dispose() }
+
+    $resultType = [Windows.Media.Ocr.OcrResult, Windows.Media.Ocr, ContentType = WindowsRuntime]
+    $result = Await-WinRT ($engine.RecognizeAsync($sb)) $resultType
+
+    # COORDINATES COME BACK RELATIVE TO THE CROPPED REGION. Add the origin so every
+    # rectangle this returns is in screen coordinates and can be fed straight to click.
+    $lines = @()
+    $words = @()
+    foreach ($line in @($result.Lines)) {
+        $lineText = @($line.Words | ForEach-Object { $_.Text }) -join ' '
+        $minX = [double]::MaxValue; $minY = [double]::MaxValue; $maxX = 0; $maxY = 0
+        foreach ($w in @($line.Words)) {
+            $r = $w.BoundingRect
+            if ($r.X -lt $minX) { $minX = $r.X }
+            if ($r.Y -lt $minY) { $minY = $r.Y }
+            if (($r.X + $r.Width) -gt $maxX) { $maxX = $r.X + $r.Width }
+            if (($r.Y + $r.Height) -gt $maxY) { $maxY = $r.Y + $r.Height }
+            # DIVIDE BY THE UPSCALE: the OCR ran on a magnified copy, so its
+            # coordinates are in magnified pixels. Every rectangle this tool returns
+            # must be a screen coordinate or a click will land in the wrong place.
+            $words += [ordered]@{
+                text = [string]$w.Text
+                x = [int]($wx + $r.X / $up); y = [int]($wy + $r.Y / $up)
+                w = [int]($r.Width / $up);   h = [int]($r.Height / $up)
+                cx = [int]($wx + ($r.X + $r.Width / 2) / $up)
+                cy = [int]($wy + ($r.Y + $r.Height / 2) / $up)
+            }
+        }
+        if ($minX -eq [double]::MaxValue) { continue }
+        $lines += [ordered]@{
+            text = $lineText
+            x = [int]($wx + $minX / $up); y = [int]($wy + $minY / $up)
+            w = [int](($maxX - $minX) / $up); h = [int](($maxY - $minY) / $up)
+            cx = [int]($wx + (($minX + $maxX) / 2) / $up)
+            cy = [int]($wy + (($minY + $maxY) / 2) / $up)
+        }
+    }
+
+    return [ordered]@{
+        region    = [ordered]@{ x = $wx; y = $wy; w = $ww; h = $wh }
+        language  = [string]$engine.RecognizerLanguage.LanguageTag
+        lineCount = $lines.Count
+        wordCount = $words.Count
+        lines     = $lines
+        words     = if ($words.Count -le 80) { $words } else { $words[0..79] }
+        elapsed_ms = [int]$sw.ElapsedMilliseconds
+        note      = 'text read from PIXELS, not from the accessibility tree. Every rectangle is in screen coordinates: pass cx/cy to a click, or use a word''s text to find a control that reports no Name. Requires the desktop to be rendering; a locked session captures black.'
+    }
+}
+
 function Tool-Wait($ta) {
     Assert-Uia
     # THE THIRD LAYER: an action plus the observation that confirms it, in one call.
@@ -1248,6 +1540,8 @@ $Tools = @(
        desc = 'Act on a ref and answer what can be verified: the target state, the window subtree size, and the top-level window count, before and after. verified:false means the request was accepted and nothing observable changed - treat it as not done.'
        schema = @{ type = 'object'; properties = @{
             ref    = @{ type = 'string'; description = 'h<number> or r<n.n.n>' }
+            x      = @{ type = 'integer'; description = 'screen coordinate (from screen_ocr), alternatives to ref' }
+            y      = @{ type = 'integer'; description = 'screen coordinate (from screen_ocr), alternatives to ref' }
             action = @{ type = 'string'; description = 'invoke (tries InvokePattern, then WM_COMMAND, then BM_CLICK) | click (mouse at the element centre, the universal fallback) | default | toggle | expand | collapse | select | focus | setvalue:<text> | window:maximize | window:minimize | window:close' } }
             required = @('ref', 'action') } }
     @{ name = 'screen_inspect'
@@ -1262,6 +1556,26 @@ $Tools = @(
     @{ name = 'screen_list'
        desc = 'Read the CONTENTS of a Win32 list control that draws its own items (SysListView32, ComboBox) using its own window messages. Use this when screen_find shows the container but no items: a virtual list (LVS_OWNERDATA) has no per-item window and is invisible to accessibility, yet answers LVM_GETITEMTEXT. Reports which message it used.'
        schema = @{ type = 'object'; properties = @{ ref = @{ type = 'string'; description = 'h<number> or r<n.n.n>, pointing at the list control' } }; required = @('ref') } }
+    @{ name = 'screen_ocr'
+       desc = 'Read text off the screen with the built-in Windows OCR engine - no install, offline. This is the fallback for controls accessibility cannot see: owner-draw buttons report an empty Name and an empty WM_GETTEXT, but their pixels still say "7" and "+". Give a ref to limit OCR to that element (faster, more accurate), or x/y/w/h, or nothing for the whole screen. All rectangles are in screen coordinates and can be clicked directly.'
+       schema = @{ type = 'object'; properties = @{
+            ref  = @{ type = 'string'; description = 'limit OCR to this element''s rectangle' }
+            x    = @{ type = 'integer' }
+            y    = @{ type = 'integer' }
+            w    = @{ type = 'integer' }
+            h    = @{ type = 'integer' }
+            lang  = @{ type = 'string'; description = 'BCP-47 tag, e.g. en-US or zh-Hans-CN. Default: matches the system UI culture.' }
+            scale = @{ type = 'number'; description = 'upscale factor before OCR (default 1). Try 2 for tiny buttons.' } } } }
+    @{ name = 'screen_shot'
+       desc = 'Capture a region or element to a PNG and report its brightness. Use it when rectangles and property values disagree, or when OCR finds nothing: it is the only way to check whether the window is covered, the text is too small, or the session is not rendering. scale:2 upscales, which often makes small text readable for screen_ocr afterwards.'
+       schema = @{ type = 'object'; properties = @{
+            ref   = @{ type = 'string'; description = 'capture this element''s rectangle' }
+            x     = @{ type = 'integer' }
+            y     = @{ type = 'integer' }
+            w     = @{ type = 'integer' }
+            h     = @{ type = 'integer' }
+            scale = @{ type = 'number'; description = 'upscale factor before saving (default 1). Try 2-4 for small text.' }
+            path  = @{ type = 'string'; description = 'PNG path (default C:/tc/screenbox/shot.png)' } } } }
     @{ name = 'screen_wait'
        desc = 'Wait until a condition holds, then answer whether it did. Use it after an action that opens a dialog, closes a window, or fills a field: it replaces "sleep and hope" and "ask again next turn" with one call that reports the fact. Condition: appear (default), vanish, enabled, value:<text>. Returns waited_ms, and on timeout present tells you which side of the condition you are on.'
        schema = @{ type = 'object'; properties = @{
@@ -1293,6 +1607,8 @@ function Invoke-Tool([string]$name, $ta) {
         'screen_inspect' { return Tool-Inspect $ta }
         'screen_keys'     { return Tool-Keys $ta }
         'screen_list'     { return Tool-List $ta }
+        'screen_ocr'      { return Tool-Ocr $ta }
+        'screen_shot'     { return Tool-Shot $ta }
         'screen_wait'     { return Tool-Wait $ta }
         'screen_launch'   { return Tool-Launch $ta }
         'screen_type'    { return Tool-Type $ta }
@@ -1330,7 +1646,7 @@ if ($SelfTest) {
             if (-not $w) { $results += @{ tool = $name; ok = $true; bytes = 0; sample = 'skipped: no window' }; continue }
             $args = [pscustomobject]@{ ref = (Get-RefFor $w) }
         }
-        if ($name -in @('screen_type','screen_keys','screen_list','screen_wait','screen_launch')) { continue }
+        if ($name -in @('screen_type','screen_keys','screen_list','screen_wait','screen_launch','screen_ocr','screen_shot')) { continue }
         if ($name -eq 'screen_find') { $args = [pscustomobject]@{ cls = 'Shell_TrayWnd' } }
         if ($name -eq 'screen_act') {
             # NOT the first window: the taskbar and Program Manager are top-level
