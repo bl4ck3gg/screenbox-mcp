@@ -418,6 +418,16 @@ function Tool-Act($ta) {
             $did = 'SelectionItemPattern.Select'
         }
         '^click$' {
+            # BRING ITS TOP-LEVEL WINDOW TO FOREGROUND FIRST: a mouse click delivered
+            # to a window that is not active can be swallowed by Windows (activation
+            # clicks are eaten by many controls).
+            try {
+                $win = Get-WindowOf $el
+                $wh = [IntPtr]$win.Current.NativeWindowHandle
+                if ($wh -ne [IntPtr]::Zero) { [Screenbox.Win32Edit]::SetForegroundWindow($wh) | Out-Null }
+                Start-Sleep -Milliseconds 150
+            } catch { }
+
             # THE MOUSE IS THE LAST RESORT AND THE ONLY UNIVERSAL ONE. A window that
             # is drawn by a framework (WinUI, Electron, CCPushButton) may expose a
             # target with no pattern, no control id and no parent that answers

@@ -144,6 +144,55 @@ So `screen_keys` now reads the foreground window and says so:
 The rule that generalises: **an action whose effect is unobservable must say it
 is unobservable, not report success.**
 
+## Five things the second dogfood run found
+
+Running the whole Notepad lifecycle - open, write, close, dismiss, exit - end to end
+surfaced five more boundaries. All five are the same shape: **the call succeeds and
+the effect does not happen.**
+
+**1. A classic Win32 dialog button has no `InvokePattern` either.**
+The Save button in the Save-As dialog reports `type: Pane`, not `Button`, and its
+pattern list is empty. `invoke` therefore falls through a chain:
+`InvokePattern` -> `WM_COMMAND(IDOK)` -> `BM_CLICK` -> coordinate click. The reply
+says which rung it used, because "the button was pressed" and "WM_COMMAND was
+posted" are different facts.
+
+**2. A DirectUI dialog button has no control id.**
+The "Don't Save" button in the "Save changes?" box has `aid: CommandButton_7`,
+which is a DirectUI name, not a Win32 control id - so `WM_COMMAND` cannot address
+it. That is what `click` exists for.
+
+**3. `SetCursorPos` succeeds in session 0 and moves nothing.**
+Measured, in the same shell:
+
+```
+session 0:  before=0,0  after=0,0
+session 2:  before=787,462  after=600,400
+```
+
+A cursor is a property of an interactive session, not of a process. The same is
+true of every input API: they do not error from the wrong session, they simply do
+nothing.
+
+**4. A mouse click needs the window in the foreground.**
+`mouse_event` at the right coordinates did nothing while another window was
+active - Windows eats the activation click. `click` now calls
+`SetForegroundWindow` on the element's top-level window first, exactly as
+`screen_keys` does.
+
+**5. Keys go to whatever has focus, which may not be what you are looking at.**
+`%n` was meant for the "Don't Save" button and landed in the PowerShell window,
+because the dialog had not been brought forward. The reply said so - `FOCUSED` was
+on the wrong window - which is why `screen_keys` returns the whole top-level list
+with its flags instead of a bare "sent".
+
+The rule these five share, and the one worth carrying out of this project:
+
+> **An input call cannot fail loudly. Nothing in Windows refuses a keystroke or a
+> click from the wrong session, the wrong foreground, or the wrong focus - it
+> accepts the call and discards the input.** So every input tool must report where
+> the input was aimed, and the caller must check that the world moved.
+
 ## Two PowerShell traps worth writing down
 
 **`$args` and `$pid` are automatic variables.** A tool parameter named `pid` is
