@@ -322,3 +322,38 @@ Tool-Ocr $args                          # Tool-Ocr 用 $ta.PSObject.Properties['
 变成"扫全屏"——不报错，只是答案错了。
 
 正确做法是 `New-Object psobject` + `Add-Member`。
+
+## stdin 的编码：一个会让所有中文静默失效的坑
+
+MCP over stdio 是逐行 JSON。桥（node）用 UTF-8 写，所以 PowerShell 必须用 UTF-8 读。
+
+问题在于 `[Console]::OutputEncoding = UTF8` **只管输出**。输入走的是
+`[Console]::InputEncoding`，中文 Windows 上默认是 GBK（代码页 936）。
+
+后果不是报错，是**每个非 ASCII 参数都被静默改写**：
+
+```
+传入 "登录"  (UTF-8: E7 99 BB E5 BD 95)
+按 936 解读  → "鐧诲綍"
+```
+
+搜索照常执行，只是永远找不到东西 —— 而"找不到"是个合法结果，所以没有任何
+迹象表明参数已经坏了。
+
+修法两条都要：
+
+```powershell
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8   # 声明
+$stdin = New-Object System.IO.StreamReader(                # 并重建 reader，
+    [Console]::OpenStandardInput(),                       # 因为 [Console]::In 可能
+    [System.Text.Encoding]::UTF8, $false, 4096)           # 早已缓存了旧的解码器
+```
+
+### 同类问题的判据
+
+任何"参数传进去、行为正确、结果为空"的情况，第一怀疑对象是**编码**，不是逻辑。
+判据：把参数原样回显出来看它是不是你传的那个字符串。这次就是靠这句报错发现的：
+
+```json
+{"found": false, "wanted": "鐧诲綍"}
+```

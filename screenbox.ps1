@@ -51,7 +51,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# BOTH SIDES OF STDIO MUST BE UTF-8. [Console]::OutputEncoding only changes stdout;
+# [Console]::InputEncoding determines how [Console]::In decodes the incoming JSON-RPC
+# stream. On a Chinese Windows install that defaults to GBK (code page 936), which
+# silently mangled every non-ASCII character in tool arguments: the UTF-8 bytes for
+# '登录' were decoded under 936 as '鐧诲綍', and every search for Chinese text failed.
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try { [Console]::InputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 # LAZY, because the protocol surface must be testable off Windows: -ListTools and
 # the framing have nothing to do with accessibility, and a script that refuses to
@@ -1811,7 +1817,8 @@ function Send($obj) {
     [Console]::Out.Flush()
 }
 
-$stdin = [Console]::In
+# Re-create the reader explicitly with UTF-8 to bypass any cached pre-InputEncoding reader.
+$stdin = New-Object System.IO.StreamReader([Console]::OpenStandardInput(), [System.Text.Encoding]::UTF8, $false, 4096)
 while ($true) {
     $line = $stdin.ReadLine()
     if ($null -eq $line) { break }
