@@ -27,7 +27,11 @@ Existing accessibility bridges (including `uia-mcp`) dump the full property bag 
 1. **PROJECTION.** A tool answers with the 8 fields an agent selects on: `ref`, `name`, `cls`, `type`, `aid`, `procId`, `rect`, and `flags`. About **130 bytes per element** — **90% smaller**, a whole window fits in a single turn.
 2. **VERIFICATION.** An action answers what can be *proven*, not what was requested: the target state, the target's subtree size, the containing window's subtree size, and the top-level window count, before and after. An action whose effect lands outside the target (a new tab, a spawned dialog) is caught by the window or top-level count (`windowKids=116 -> 121`).
 
-## Tools (5)
+## Tools (7)
+
+See [docs/why.md](docs/why.md) for why each one exists, the measurements behind
+the projection rule, and the four Windows GUI boundaries found by using this
+server on a real Notepad.
 
 | Tool | What it does | Typical size |
 |---|---|---|
@@ -35,7 +39,9 @@ Existing accessibility bridges (including `uia-mcp`) dump the full property bag 
 | `screen_windows` | Top-level windows, one compact line each. | ~130 B / window |
 | `screen_find` | Search descendants by selector (`cls`, `aid`, `name`, `type`, `procId`, `under`, `top`, `limit`). | ~130 B / item |
 | `screen_act` | Perform an action (`invoke`, `default`, `toggle`, `expand`, `collapse`, `select`, `focus`, `setvalue:<text>`, `window:maximize`, `window:minimize`, `window:close`) and verify against the before/after fingerprint. | ~300 B |
-| `screen_type` | Type literal text into whatever has keyboard focus via `SendKeys` (reaches menus and custom controls that expose no UIA pattern). | ~250 B |
+| `screen_inspect` | Read one element without acting: its state, the patterns it supports, child count. | ~200 B |
+| `screen_keys` | Send a key chord (`^s`, `%f`, `{ENTER}`). Reports the foreground window, because a disconnected RDP session has none and keys then go nowhere. | ~700 B |
+| `screen_type` | Type literal text into whatever has focus via SendKeys. | ~250 B |
 
 ## Self-describing refs
 
