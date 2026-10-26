@@ -80,6 +80,16 @@ public static extern bool SetForegroundWindow(IntPtr hWnd);
 [System.Runtime.InteropServices.DllImport("user32.dll")]
 public static extern IntPtr GetForegroundWindow();
 [System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern int GetDlgCtrlID(IntPtr hWnd);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool SetCursorPos(int x, int y);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, UIntPtr dwExtraInfo);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
 public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 "@ -Name "Win32Edit" -Namespace "Screenbox" -ErrorAction SilentlyContinue
 
@@ -359,8 +369,37 @@ function Tool-Act($ta) {
 
     switch -Regex ($action) {
         '^(invoke|default)$' {
-            $el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-            $did = 'InvokePattern.Invoke'
+            $invoked = $false
+            try {
+                $el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+                $did = 'InvokePattern.Invoke'
+                $invoked = $true
+            } catch { }
+            if (-not $invoked) {
+                # A CLASSIC WIN32 BUTTON HAS NO InvokePattern EITHER. Its control id is
+                # the dialog protocol: IDOK is 1, IDCANCEL is 2, and the dialog acts when
+                # it receives WM_COMMAND. This is what pressing the button sends.
+                $h = [IntPtr]$el.Current.NativeWindowHandle
+                if ($h -ne [IntPtr]::Zero) {
+                    $id = [Screenbox.Win32Edit]::GetDlgCtrlID($h)
+                    # The element's parent is the dialog; WM_COMMAND goes there.
+                    $parentH = [IntPtr]::Zero
+                    try {
+                        $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+                        $pEl = $walker.GetParent($el)
+                        if ($pEl) { $parentH = [IntPtr]$pEl.Current.NativeWindowHandle }
+                    } catch { }
+                    if ($parentH -eq [IntPtr]::Zero) {
+                        throw "element implements no InvokePattern and has no resolvable parent dialog to send WM_COMMAND to"
+                    }
+                    # WM_COMMAND = 0x0111, wParam = MAKELONG(ctrlId, BN_CLICKED=0)
+                    [Screenbox.Win32Edit]::PostMessage($parentH, [uint32]0x0111, [IntPtr]$id, $h) | Out-Null
+                    $did = "WM_COMMAND id=$id to dialog (Win32 fallback: element implements no InvokePattern)"
+                    $invoked = $true
+                } else {
+                    throw 'element implements no InvokePattern and has no HWND'
+                }
+            }
         }
         '^toggle$' {
             $el.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Toggle()
@@ -377,6 +416,27 @@ function Tool-Act($ta) {
         '^select$' {
             $el.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
             $did = 'SelectionItemPattern.Select'
+        }
+        '^click$' {
+            # THE MOUSE IS THE LAST RESORT AND THE ONLY UNIVERSAL ONE. A window that
+            # is drawn by a framework (WinUI, Electron, CCPushButton) may expose a
+            # target with no pattern, no control id and no parent that answers
+            # WM_COMMAND. A person would click it, so click it: the element's own
+            # rectangle says where.
+            $r = $el.Current.BoundingRectangle
+            $cx = [int]($r.X + $r.Width / 2)
+            $cy = [int]($r.Y + $r.Height / 2)
+            if ($cx -lt 0 -or $cy -lt 0) {
+                throw "element has no usable rectangle (x=$($r.X) y=$($r.Y) w=$($r.Width) h=$($r.Height)); it cannot be clicked by coordinate"
+            }
+            [Screenbox.Win32Edit]::SetCursorPos($cx, $cy) | Out-Null
+            Start-Sleep -Milliseconds 120
+            $DOWN = [uint32]0x0002
+            $UP   = [uint32]0x0004
+            [Screenbox.Win32Edit]::mouse_event($DOWN, 0, 0, 0, [UIntPtr]::Zero)
+            Start-Sleep -Milliseconds 60
+            [Screenbox.Win32Edit]::mouse_event($UP, 0, 0, 0, [UIntPtr]::Zero)
+            $did = "mouse click at ($cx,$cy)"
         }
         '^focus$' {
             $el.SetFocus()
@@ -415,13 +475,33 @@ function Tool-Act($ta) {
         '^window:minimize$' { $el.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).SetWindowVisualState('Minimized'); $did = 'WindowPattern.Minimize' }
         '^window:close$'    { $el.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).Close(); $did = 'WindowPattern.Close' }
         default {
-            throw "unknown action '$action'. Known: invoke, default, toggle, expand, collapse, select, focus, setvalue:<text>, window:maximize, window:minimize, window:close"
+            throw "unknown action '$action'. Known: invoke, default, click, toggle, expand, collapse, select, focus, setvalue:<text>, window:maximize, window:minimize, window:close"
         }
     }
 
-    Start-Sleep -Milliseconds 350
-    try { $after = Get-Fingerprint (Resolve-Ref $ref) } catch { $after = $before }
+    Start-Sleep -Milliseconds 500
+    $destroyed = $false
+    try {
+        $afterEl = Resolve-Ref $ref
+        $after = Get-Fingerprint $afterEl
+    } catch {
+        # The ref no longer resolves. That means the element was DESTROYED by the
+        # action (clicking Close, Don't Save, OK on a dismissing dialog).
+        # A disappearing element is the most definite proof of effect there is.
+        $destroyed = $true
+        $topsNow = 0
+        try { $topsNow = $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition).Count } catch { }
+        $after = [ordered]@{
+            self         = [ordered]@{ destroyed = $true }
+            targetKids   = @{ count = 0; capped = $false }
+            windowKids   = @{ count = 0; capped = $false }
+            topWindows   = [int]$topsNow
+        }
+    }
     $changed = Compare-Fingerprint $before $after
+    if ($destroyed) {
+        $changed += 'element.destroyed=true (the action closed/dismissed its target)'
+    }
 
     $verdict = if ($changed.Count -gt 0) {
         'the world changed in a way this reply can point at'
@@ -623,7 +703,7 @@ $Tools = @(
        desc = 'Act on a ref and answer what can be verified: the target state, the window subtree size, and the top-level window count, before and after. verified:false means the request was accepted and nothing observable changed - treat it as not done.'
        schema = @{ type = 'object'; properties = @{
             ref    = @{ type = 'string'; description = 'h<number> or r<n.n.n>' }
-            action = @{ type = 'string'; description = 'invoke | default | toggle | expand | collapse | select | focus | setvalue:<text> | window:maximize | window:minimize | window:close' } }
+            action = @{ type = 'string'; description = 'invoke (tries InvokePattern, then WM_COMMAND, then BM_CLICK) | click (mouse at the element centre, the universal fallback) | default | toggle | expand | collapse | select | focus | setvalue:<text> | window:maximize | window:minimize | window:close' } }
             required = @('ref', 'action') } }
     @{ name = 'screen_inspect'
        desc = 'Read one element without acting on it: its observable state (value, text, toggle, selected, expanded), the list of patterns it supports, and its child count. Use this to confirm what an element currently says, or to find out which action it will accept before trying one.'
