@@ -875,6 +875,81 @@ function Tool-List($ta) {
     }
 }
 
+function Tool-Wait($ta) {
+    Assert-Uia
+    # THE THIRD LAYER: an action plus the observation that confirms it, in one call.
+    # Without this the caller either sleeps a guessed interval or spends a turn asking
+    # "did it happen yet", and both are wrong in the same way - they replace a fact
+    # with a guess. This waits for a CONDITION and answers whether it became true.
+    $until   = if ($ta.PSObject.Properties['until'])   { [string]$ta.until } else { 'appear' }
+    $timeout = if ($ta.PSObject.Properties['timeout']) { [double]$ta.timeout } else { 5.0 }
+    $poll    = 200
+    $deadline = (Get-Date).AddSeconds($timeout)
+
+    $cls  = if ($ta.PSObject.Properties['cls'])    { [string]$ta.cls } else { '' }
+    $aid  = if ($ta.PSObject.Properties['aid'])    { [string]$ta.aid } else { '' }
+    $name = if ($ta.PSObject.Properties['name'])   { [string]$ta.name } else { '' }
+    $type = if ($ta.PSObject.Properties['type'])   { [string]$ta.type } else { '' }
+    $proc = if ($ta.PSObject.Properties['procId']) { [int]$ta.procId } else { 0 }
+    $under = if ($ta.PSObject.Properties['under']) { [string]$ta.under } else { '' }
+
+    $parts = @()
+    if ($cls)  { $parts += New-Object System.Windows.Automation.PropertyCondition($AE::ClassNameProperty, $cls) }
+    if ($aid)  { $parts += New-Object System.Windows.Automation.PropertyCondition($AE::AutomationIdProperty, $aid) }
+    if ($name) { $parts += New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, $name) }
+    if ($type) { $ct = [System.Windows.Automation.ControlType]::$type
+                 $parts += New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $ct) }
+    if ($proc) { $parts += New-Object System.Windows.Automation.PropertyCondition($AE::ProcessIdProperty, $proc) }
+    if ($parts.Count -eq 0) { throw 'screen_wait needs a bound: at least one selector (cls, aid, name, type, procId) or under <ref>' }
+    $cond = if ($parts.Count -eq 1) { $parts[0] } else { New-Object System.Windows.Automation.AndCondition($parts) }
+
+    $start = Get-Date
+    $saw = 0
+    $last = $null
+    while ((Get-Date) -lt $deadline) {
+        $root = if ($under) { try { Resolve-Ref $under } catch { $null } } else { $AE::RootElement }
+        if ($root) {
+            try {
+                $hit = $root.FindFirst($TS::Descendants, $cond)
+                $saw = if ($hit) { 1 } else { 0 }
+                $last = $hit
+            } catch { $saw = 0; $last = $null }
+        }
+        $ok = $false
+        switch -Regex ($until) {
+            '^appear$'  { $ok = ($saw -eq 1) }
+            '^vanish$'  { $ok = ($saw -eq 0) }
+            '^enabled$' { if ($last) { try { $ok = $last.Current.IsEnabled } catch { $ok = $false } } }
+            '^value:'   { if ($last) {
+                            $want = $Matches['v']
+                            try {
+                                $vp = $last.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+                                $ok = ([string]$vp.Current.Value -eq $want)
+                            } catch { $ok = $false }
+                          } }
+            default { throw "unknown condition '$until'. Known: appear, vanish, enabled, value:<text>" }
+        }
+        if ($ok) {
+            $ms = [int]((Get-Date) - $start).TotalMilliseconds
+            return [ordered]@{
+                satisfied = $true
+                until     = $until
+                waited_ms = $ms
+                item      = if ($last) { Get-Brief $last } else { $null }
+            }
+        }
+        Start-Sleep -Milliseconds $poll
+    }
+    return [ordered]@{
+        satisfied = $false
+        until     = $until
+        waited_ms = [int]((Get-Date) - $start).TotalMilliseconds
+        present   = ($saw -eq 1)
+        item      = if ($last) { Get-Brief $last } else { $null }
+        note      = 'the condition did not become true within the window. present tells you which side of it you are on: if present is true and until was vanish, the element is still there.'
+    }
+}
+
 function Tool-Type($ta) {
     Assert-Uia
     $text = if ($ta.PSObject.Properties['text']) { [string]$ta.text } else { '' }
@@ -944,6 +1019,17 @@ $Tools = @(
     @{ name = 'screen_list'
        desc = 'Read the CONTENTS of a Win32 list control that draws its own items (SysListView32, ComboBox) using its own window messages. Use this when screen_find shows the container but no items: a virtual list (LVS_OWNERDATA) has no per-item window and is invisible to accessibility, yet answers LVM_GETITEMTEXT. Reports which message it used.'
        schema = @{ type = 'object'; properties = @{ ref = @{ type = 'string'; description = 'h<number> or r<n.n.n>, pointing at the list control' } }; required = @('ref') } }
+    @{ name = 'screen_wait'
+       desc = 'Wait until a condition holds, then answer whether it did. Use it after an action that opens a dialog, closes a window, or fills a field: it replaces "sleep and hope" and "ask again next turn" with one call that reports the fact. Condition: appear (default), vanish, enabled, value:<text>. Returns waited_ms, and on timeout present tells you which side of the condition you are on.'
+       schema = @{ type = 'object'; properties = @{
+            until   = @{ type = 'string'; description = 'appear | vanish | enabled | value:<text>' }
+            timeout = @{ type = 'number'; description = 'seconds to wait (default 5)' }
+            cls     = @{ type = 'string' }
+            aid     = @{ type = 'string' }
+            name    = @{ type = 'string' }
+            type    = @{ type = 'string' }
+            procId  = @{ type = 'integer' }
+            under   = @{ type = 'string'; description = 'a ref to search inside' } } } }
     @{ name = 'screen_type'
        desc = 'Type literal text into the focused element via SendKeys (reaches menus and dialogs that expose no pattern), then report the focused element fingerprint before and after.'
        schema = @{ type = 'object'; properties = @{ text = @{ type = 'string' } }; required = @('text') } }
@@ -958,6 +1044,7 @@ function Invoke-Tool([string]$name, $ta) {
         'screen_inspect' { return Tool-Inspect $ta }
         'screen_keys'     { return Tool-Keys $ta }
         'screen_list'     { return Tool-List $ta }
+        'screen_wait'     { return Tool-Wait $ta }
         'screen_type'    { return Tool-Type $ta }
         default { throw "unknown tool '$name'" }
     }
@@ -993,7 +1080,7 @@ if ($SelfTest) {
             if (-not $w) { $results += @{ tool = $name; ok = $true; bytes = 0; sample = 'skipped: no window' }; continue }
             $args = [pscustomobject]@{ ref = (Get-RefFor $w) }
         }
-        if ($name -eq 'screen_type' -or $name -eq 'screen_keys' -or $name -eq 'screen_list') { continue }
+        if ($name -in @('screen_type','screen_keys','screen_list','screen_wait')) { continue }
         if ($name -eq 'screen_find') { $args = [pscustomobject]@{ cls = 'Shell_TrayWnd' } }
         if ($name -eq 'screen_act') {
             # NOT the first window: the taskbar and Program Manager are top-level
