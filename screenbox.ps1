@@ -184,7 +184,10 @@ function Get-Brief($el) {
 
 function Get-State($el) {
     $p = $el.Current
-    $s = [ordered]@{ name = [string]$p.Name; enabled = $p.IsEnabled; offscreen = $p.IsOffscreen }
+    # focused IS observable and it is exactly what action 'focus' changes. Leaving it
+    # out made focus: report verified:false on every successful focus, which is the
+    # same lie in the other direction.
+    $s = [ordered]@{ name = [string]$p.Name; enabled = $p.IsEnabled; offscreen = $p.IsOffscreen; focused = $p.HasKeyboardFocus }
     try { $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
           $s.value = [string]$vp.Current.Value } catch { }
     try { $tp = $el.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
@@ -322,6 +325,12 @@ function Tool-Find($ta) {
     $top  = if ($ta.PSObject.Properties['top'])     { [bool]$ta.top } else { $false }
     $under = if ($ta.PSObject.Properties['under'])  { [string]$ta.under } else { '' }
     $limit = if ($ta.PSObject.Properties['limit'])  { [int]$ta.limit } else { $ItemLimit }
+    # VISIBLE BY DEFAULT: in a browser or scrollable list a page holds hundreds of
+    # elements offscreen (often thousands of pixels below the fold). Returning them
+    # eats the caller's limit on things that cannot be seen and cannot be clicked
+    # by coordinate. Set visible:false to include them.
+    $onlyVis = $true
+    if ($ta.PSObject.Properties['visible'] -and (-not [bool]$ta.visible)) { $onlyVis = $false }
 
     $parts = @()
     if ($cls)  { $parts += New-Object System.Windows.Automation.PropertyCondition($AE::ClassNameProperty, $cls) }
@@ -347,8 +356,30 @@ function Tool-Find($ta) {
 
     $found = $root.FindAll($scope, $cond)
     $items = @()
+    $screenW = 1920
+    $screenH = 1080
+    try {
+        $screenW = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width
+        $screenH = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height
+    } catch { }
     foreach ($e in $found) {
         if ($items.Count -ge $limit) { break }
+        if ($onlyVis) {
+            # TWO CRITERIA, because each misses half the cases: IsOffscreen is false
+            # for controls in web pages whose layout has not been culled by Chromium,
+            # while their bounding rectangle sits at y=2000+. And a control with
+            # valid coordinates inside the screen can report IsOffscreen if covered.
+            try {
+                if ($e.Current.IsOffscreen) { continue }
+                $r = $e.Current.BoundingRectangle
+                # PowerShell has no '<' or '>' operators: they are reserved for redirection,
+                # so a comparison must be spelled -lt / -le / -gt / -ge.
+                if (($r.X + $r.Width) -le 0) { continue }
+                if (($r.Y + $r.Height) -le 0) { continue }
+                if ($r.X -ge $screenW) { continue }
+                if ($r.Y -ge $screenH) { continue }
+            } catch { continue }
+        }
         $items += Get-Brief $e
     }
     return [ordered]@{
@@ -449,8 +480,32 @@ function Tool-Act($ta) {
             $did = "mouse click at ($cx,$cy)"
         }
         '^focus$' {
-            $el.SetFocus()
-            $did = 'SetFocus'
+            $focused = $false
+            try {
+                $el.SetFocus()
+                $did = 'SetFocus'
+                $focused = $true
+            } catch { }
+            if (-not $focused) {
+                # A CLASSIC WIN32 CONTROL CANNOT TAKE FOCUS THROUGH UIA. Notepad's edit
+                # answers "the target element cannot receive focus" to SetFocus even
+                # though a person clicks into it every day. What a person does is bring
+                # the window forward and click the control, so do that.
+                $win = Get-WindowOf $el
+                $wh = [IntPtr]$win.Current.NativeWindowHandle
+                if ($wh -ne [IntPtr]::Zero) { [Screenbox.Win32Edit]::SetForegroundWindow($wh) | Out-Null }
+                Start-Sleep -Milliseconds 150
+                $r = $el.Current.BoundingRectangle
+                $cx = [int]($r.X + $r.Width / 2)
+                $cy = [int]($r.Y + $r.Height / 2)
+                if ($cx -lt 0 -or $cy -lt 0) { throw 'element cannot take focus and has no usable rectangle to click' }
+                [Screenbox.Win32Edit]::SetCursorPos($cx, $cy) | Out-Null
+                Start-Sleep -Milliseconds 100
+                [Screenbox.Win32Edit]::mouse_event([uint32]0x0002, 0, 0, 0, [UIntPtr]::Zero)
+                Start-Sleep -Milliseconds 60
+                [Screenbox.Win32Edit]::mouse_event([uint32]0x0004, 0, 0, 0, [UIntPtr]::Zero)
+                $did = "click to focus at ($cx,$cy) (Win32 fallback: element refuses SetFocus)"
+            }
         }
         '^setvalue:(?<v>[\s\S]*)$' {
             $val = $Matches['v']
@@ -708,7 +763,8 @@ $Tools = @(
             procId = @{ type = 'integer'; description = 'owning process id (not "pid": that name is reserved in PowerShell)' }
             under  = @{ type = 'string'; description = 'a ref to search inside' }
             top    = @{ type = 'boolean'; description = 'search direct children only' }
-            limit  = @{ type = 'integer'; description = 'max records returned (default 40)' } } } }
+            limit   = @{ type = 'integer'; description = 'max records returned (default 40)' }
+            visible = @{ type = 'boolean'; description = 'filter to elements currently inside the screen (default true). Set false to include offscreen elements below the fold.' } } } }
     @{ name = 'screen_act'
        desc = 'Act on a ref and answer what can be verified: the target state, the window subtree size, and the top-level window count, before and after. verified:false means the request was accepted and nothing observable changed - treat it as not done.'
        schema = @{ type = 'object'; properties = @{
