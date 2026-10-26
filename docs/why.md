@@ -357,3 +357,28 @@ $stdin = New-Object System.IO.StreamReader(                # 并重建 reader，
 ```json
 {"found": false, "wanted": "鐧诲綍"}
 ```
+
+## OCR 的固有局限：形近字
+
+实测 Gitee 页面：
+
+```
+想要的   "热门项目"
+OCR 读到 "热 门 顶 目"    ← "项" 被认成 "顶"
+```
+
+`screen_click_text` 因此报 `found:false` 并把 `seen` 全列出来，让人一眼看出是
+"字认错了"还是"区域错了"。这比静默点错地方好得多。
+
+换个字形不冲突的词就成功：
+
+```json
+{"found":true,"matched":{"text":"前 沿 技 术","cx":220,"cy":437},
+ "how":"exact line","clicked":true,"verified":true,"did":"InvokePattern.Invoke"}
+```
+
+之后 Edge 标题变成 `前沿技术 - 热门项目 - Gitee.com` —— 真的跳转了。
+
+**判据**：OCR 适合找**字形独特**的标签（编号、英文、生僻组合）。对形近字密集的
+短语，要么用无障碍树（`screen_find`）当主路，要么接受 `seen` 里的候选人工判断。
+不要把 OCR 当成无条件的最后手段。
