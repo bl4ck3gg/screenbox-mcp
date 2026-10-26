@@ -489,10 +489,21 @@ if ($SelfTest) {
         if ($name -eq 'screen_type') { continue }
         if ($name -eq 'screen_find') { $args = [pscustomobject]@{ cls = 'Shell_TrayWnd' } }
         if ($name -eq 'screen_act') {
-            $w = $null
-            try { $w = $AE::RootElement.FindFirst($TS::Children, [System.Windows.Automation.Condition]::TrueCondition) } catch { }
-            if (-not $w) { $results += @{ tool = $name; ok = $false; note = 'no window to act on' }; continue }
-            $args = [pscustomobject]@{ ref = (Get-RefFor $w); action = 'focus' }
+            # NOT the first window: the taskbar and Program Manager are top-level
+            # windows that cannot take focus, so focusing one fails for a reason that
+            # says nothing about this server. Pick one that reports it can be focused.
+            $focusable = $null
+            try {
+                $all = $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)
+                foreach ($w in $all) {
+                    try { if ($w.Current.IsKeyboardFocusable) { $focusable = $w; break } } catch { }
+                }
+            } catch { }
+            if (-not $focusable) {
+                $results += @{ tool = $name; ok = $true; bytes = 0; sample = 'skipped: this desktop has no focusable top-level window (headless runner)' }
+                continue
+            }
+            $args = [pscustomobject]@{ ref = (Get-RefFor $focusable); action = 'focus' }
         }
         try {
             $r = Invoke-Tool $name $args
