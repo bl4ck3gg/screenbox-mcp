@@ -82,6 +82,12 @@ public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 [System.Runtime.InteropServices.DllImport("user32.dll")]
 public static extern IntPtr GetForegroundWindow();
 [System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool BringWindowToTop(IntPtr hWnd);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+[System.Runtime.InteropServices.DllImport("kernel32.dll")]
+public static extern uint GetCurrentThreadId();
+[System.Runtime.InteropServices.DllImport("user32.dll")]
 public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 [System.Runtime.InteropServices.DllImport("user32.dll")]
 public static extern int GetDlgCtrlID(IntPtr hWnd);
@@ -113,7 +119,7 @@ public static extern bool WriteProcessMemory(IntPtr proc, IntPtr addr, byte[] bu
 public static extern bool ReadProcessMemory(IntPtr proc, IntPtr addr, byte[] buf, IntPtr n, out IntPtr read);
 [System.Runtime.InteropServices.DllImport("kernel32.dll")]
 public static extern bool CloseHandle(IntPtr h);
-"@ -Name "Win32Edit" -Namespace "Screenbox" -ErrorAction SilentlyContinue
+"@ -Name "Win32Edit" -Namespace "Screenbox"
 
 
 # LVITEMW as a real struct: hand-computed offsets are an ABI guess that reads back
@@ -276,6 +282,54 @@ function Count-Subtree($el, [int]$cap) {
         } catch { }
     }
     return @{ count = $n; capped = $false }
+}
+
+function Force-Foreground([IntPtr]$h) {
+    # SetForegroundWindow ALONE IS NOT ENOUGH, and its return value lies. Windows only
+    # grants the foreground to a process that already owns it, so a background process
+    # calling SetForegroundWindow gets `true` while the window stays behind - measured
+    # on this machine: the call returned True and GetForegroundWindow still reported
+    # Edge. The documented way around it is to attach to the current foreground
+    # thread's input queue first, which makes the two threads share one focus state,
+    # then hand the foreground over.
+    #
+    # This returns the outcome as a fact: whether the target is the foreground window
+    # afterwards. Callers must not assume success.
+    if ($h -eq [IntPtr]::Zero) { return $false }
+    [Screenbox.Win32Edit]::ShowWindow($h, 9) | Out-Null    # SW_RESTORE
+
+    $fg = [Screenbox.Win32Edit]::GetForegroundWindow()
+    if ($fg -eq $h) { return $true }
+
+    $targetThread = 0
+    $fgThread = 0
+    try {
+        $p = [uint32]0
+        $targetThread = [Screenbox.Win32Edit]::GetWindowThreadProcessId($h, [ref]$p)
+        if ($fg -ne [IntPtr]::Zero) { $fgThread = [Screenbox.Win32Edit]::GetWindowThreadProcessId($fg, [ref]$p) }
+    } catch { }
+
+    $me = [Screenbox.Win32Edit]::GetCurrentThreadId()
+    $attached = $false
+    if ($fgThread -ne 0 -and $fgThread -ne $me) {
+        try { $attached = [Screenbox.Win32Edit]::AttachThreadInput($me, $fgThread, $true) } catch { }
+    }
+    try {
+        [Screenbox.Win32Edit]::BringWindowToTop($h) | Out-Null
+        [Screenbox.Win32Edit]::SetForegroundWindow($h) | Out-Null
+        # A control can also be focused directly once its thread shares our input queue.
+        if ($targetThread -ne 0 -and $targetThread -ne $me -and -not $attached) {
+            try {
+                $a2 = [Screenbox.Win32Edit]::AttachThreadInput($me, $targetThread, $true)
+                if ($a2) { [Screenbox.Win32Edit]::AttachThreadInput($me, $targetThread, $false) | Out-Null }
+            } catch { }
+        }
+    } finally {
+        if ($attached) { try { [Screenbox.Win32Edit]::AttachThreadInput($me, $fgThread, $false) | Out-Null } catch { } }
+    }
+
+    Start-Sleep -Milliseconds 120
+    return ([Screenbox.Win32Edit]::GetForegroundWindow() -eq $h)
 }
 
 function Get-WindowOf($el) {
@@ -569,31 +623,70 @@ function Tool-Act($ta) {
             $did = "mouse click at ($cx,$cy)"
         }
         '^focus$' {
-            $focused = $false
-            try {
-                $el.SetFocus()
-                $did = 'SetFocus'
-                $focused = $true
-            } catch { }
-            if (-not $focused) {
-                # A CLASSIC WIN32 CONTROL CANNOT TAKE FOCUS THROUGH UIA. Notepad's edit
-                # answers "the target element cannot receive focus" to SetFocus even
-                # though a person clicks into it every day. What a person does is bring
-                # the window forward and click the control, so do that.
-                $win = Get-WindowOf $el
-                $wh = [IntPtr]$win.Current.NativeWindowHandle
-                if ($wh -ne [IntPtr]::Zero) { [Screenbox.Win32Edit]::SetForegroundWindow($wh) | Out-Null }
-                Start-Sleep -Milliseconds 150
-                $r = $el.Current.BoundingRectangle
-                $cx = [int]($r.X + $r.Width / 2)
-                $cy = [int]($r.Y + $r.Height / 2)
-                if ($cx -lt 0 -or $cy -lt 0) { throw 'element cannot take focus and has no usable rectangle to click' }
-                [Screenbox.Win32Edit]::SetCursorPos($cx, $cy) | Out-Null
-                Start-Sleep -Milliseconds 100
-                [Screenbox.Win32Edit]::mouse_event([uint32]0x0002, 0, 0, 0, [UIntPtr]::Zero)
-                Start-Sleep -Milliseconds 60
-                [Screenbox.Win32Edit]::mouse_event([uint32]0x0004, 0, 0, 0, [UIntPtr]::Zero)
-                $did = "click to focus at ($cx,$cy) (Win32 fallback: element refuses SetFocus)"
+            # TWO MODES FOR FOCUS, because "has focus" is not one question.
+            #
+            # 1. When an interactive user is looking at the screen (GetForegroundWindow != 0):
+            #    SetFocus via UIA, or bring the window forward and click it. UIA's
+            #    HasKeyboardFocus will turn true once the target owns the keyboard.
+            #
+            # 2. When the session has no active viewer (unattended RDP, disconnected):
+            #    GetForegroundWindow is 0. Windows refuses to set foreground, mouse clicks
+            #    hit no active surface, and UIA's HasKeyboardFocus is FALSE FOR EVERY
+            #    ELEMENT ON THE MACHINE because there is no keyboard route to any of them.
+            #    Yet the application itself has internal focus: SetFocus inside the thread
+            #    works, and controls like Notepad's Edit process WM_SETTEXT and messages
+            #    just fine.
+            #
+            # The tool must report which regime it is in rather than trying a mouse click
+            # into the void and failing.
+            $did = ''
+            $fg = [Screenbox.Win32Edit]::GetForegroundWindow()
+            if ($fg -eq [IntPtr]::Zero) {
+                # Unattended regime: move thread focus directly, don't pretend a click works.
+                $targetH = [IntPtr]$el.Current.NativeWindowHandle
+                if ($targetH -ne [IntPtr]::Zero) {
+                    $targetPid = [uint32]0
+                    $targetTid = [Screenbox.Win32Edit]::GetWindowThreadProcessId($targetH, [ref]$targetPid)
+                    $me = [Screenbox.Win32Edit]::GetCurrentThreadId()
+                    $att = [Screenbox.Win32Edit]::AttachThreadInput($me, $targetTid, $true)
+                    try {
+                        [Screenbox.Win32Edit]::BringWindowToTop($targetH) | Out-Null
+                        # Post WM_SETFOCUS as a notification to the control
+                        [Screenbox.Win32Edit]::PostMessage($targetH, [uint32]0x0007, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+                        $did = "thread-level focus assigned (session is unattended: GetForegroundWindow is 0, so keyboard input cannot reach this window until a user connects; internal control focus set)"
+                    } finally {
+                        if ($att) { [Screenbox.Win32Edit]::AttachThreadInput($me, $targetTid, $false) | Out-Null }
+                    }
+                } else {
+                    throw "element has no HWND and session has no active foreground window; focus cannot be set"
+                }
+            } else {
+                # Interactive regime: standard UIA SetFocus with fallback to click
+                $focused = $false
+                try {
+                    $el.SetFocus()
+                    $did = 'SetFocus'
+                    $focused = $true
+                } catch { }
+                if (-not $focused) {
+                    $win = Get-WindowOf $el
+                    $wh = [IntPtr]::Zero
+                    if ($win) { $wh = [IntPtr]$win.Current.NativeWindowHandle }
+                    Force-Foreground $wh | Out-Null
+                    $r = $el.Current.BoundingRectangle
+                    $cx = [int]($r.X + $r.Width / 2)
+                    $cy = [int]($r.Y + $r.Height / 2)
+                    if ($cx -ge 0 -and $cy -ge 0) {
+                        [Screenbox.Win32Edit]::SetCursorPos($cx, $cy) | Out-Null
+                        Start-Sleep -Milliseconds 100
+                        [Screenbox.Win32Edit]::mouse_event([uint32]0x0002, 0, 0, 0, [UIntPtr]::Zero)
+                        Start-Sleep -Milliseconds 60
+                        [Screenbox.Win32Edit]::mouse_event([uint32]0x0004, 0, 0, 0, [UIntPtr]::Zero)
+                        $did = "click to focus at ($cx,$cy) (Win32 fallback: element refuses SetFocus)"
+                    } else {
+                        throw "element refuses SetFocus and has no usable rectangle to click"
+                    }
+                }
             }
         }
         '^setvalue:(?<v>[\s\S]*)$' {
@@ -1093,6 +1186,17 @@ function Tool-Type($ta) {
     Assert-Uia
     $text = if ($ta.PSObject.Properties['text']) { [string]$ta.text } else { '' }
     if ([string]::IsNullOrEmpty($text)) { throw 'screen_type needs text' }
+
+    # KEYBOARD INPUT NEEDS A KEYBOARD ROUTE. On a disconnected RDP session there is no
+    # foreground window, so SendKeys (a journal hook) and keybd_event both write into a
+    # queue that nothing consumes: the call succeeds, the text goes nowhere, and the only
+    # sign is that the fingerprint did not change. Say it instead of letting the caller
+    # infer it from a silent no-op.
+    $fg = [Screenbox.Win32Edit]::GetForegroundWindow()
+    if ($fg -eq [IntPtr]::Zero) {
+        throw 'this session has no foreground window (GetForegroundWindow returned 0), so typed keys have no route to any application and would be discarded. Connect to the desktop, or use screen_act setvalue on the target element, which sets text through the control rather than through the keyboard.'
+    }
+
     # SendKeys treats these as syntax, so a literal one has to be braced.
     $esc = $text -replace '([+^%~(){}\[\]])', '{$1}'
     $focusRef = ''
@@ -1113,7 +1217,7 @@ function Tool-Type($ta) {
         changed  = $changed
         before   = $before
         after    = $after
-        note     = 'SendKeys reaches menus and dialogs that expose no pattern. It types into whatever has focus, so screen_act focus:<ref> first when the target is not already focused.'
+        note     = 'SendKeys reaches menus and dialogs that expose no pattern. It types into whatever has focus, so screen_act focus:<ref> first when the target is not already focused. It needs an interactive desktop: with no foreground window this refuses rather than typing into the void - use screen_act setvalue for controls that can hold text without the keyboard.'
     }
 }
 
