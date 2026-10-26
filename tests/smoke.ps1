@@ -28,7 +28,7 @@ Write-Host "== screenbox smoke tests ==" -ForegroundColor Cyan
 Write-Host "`n1. tool catalogue"
 $raw = & $Interp -NoProfile -File $Script -ListTools
 $cat = $raw | ConvertFrom-Json
-Assert-True ($cat.tools.Count -eq 7) "catalogue holds 7 tools (got $($cat.tools.Count))"
+Assert-True ($cat.tools.Count -eq 8) "catalogue holds 8 tools (got $($cat.tools.Count))"
 $names = @($cat.tools | ForEach-Object { $_.name })
 Assert-True ($names -contains 'screen_info') 'catalogue names screen_info'
 Assert-True ($names -contains 'screen_windows') 'catalogue names screen_windows'

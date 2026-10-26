@@ -89,9 +89,55 @@ public static extern bool SetCursorPos(int x, int y);
 public static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, UIntPtr dwExtraInfo);
 [System.Runtime.InteropServices.DllImport("user32.dll")]
 public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+[System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "SendMessageW")]
+public static extern IntPtr SendMessageBuf(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+[System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "SendMessageW")]
+public static extern IntPtr SendMessagePtr(IntPtr hWnd, uint Msg, IntPtr wParam, System.IntPtr[] lParam);
 [System.Runtime.InteropServices.DllImport("user32.dll")]
 public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern int GetClassNameW(IntPtr hWnd, System.Text.StringBuilder s, int n);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern IntPtr VirtualAllocEx(IntPtr proc, IntPtr addr, IntPtr size, uint type, uint protect);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool VirtualFreeEx(IntPtr proc, IntPtr addr, IntPtr size, uint type);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool WriteProcessMemory(IntPtr proc, IntPtr addr, byte[] buf, IntPtr n, out IntPtr written);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool ReadProcessMemory(IntPtr proc, IntPtr addr, byte[] buf, IntPtr n, out IntPtr read);
+[System.Runtime.InteropServices.DllImport("kernel32.dll")]
+public static extern bool CloseHandle(IntPtr h);
 "@ -Name "Win32Edit" -Namespace "Screenbox" -ErrorAction SilentlyContinue
+
+
+# LVITEMW as a real struct: hand-computed offsets are an ABI guess that reads back
+# garbage rather than failing, so let the marshaller compute them.
+if (-not ('ScreenboxLVITEM' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+[StructLayout(LayoutKind.Sequential)]
+public struct ScreenboxLVITEM {
+    public uint mask;
+    public int iItem;
+    public int iSubItem;
+    public uint state;
+    public uint stateMask;
+    public IntPtr pszText;
+    public int cchTextMax;
+    public int iImage;
+    public IntPtr lParam;
+    public int iIndent;
+    public int iGroupId;
+    public uint cColumns;
+    public IntPtr puColumns;
+}
+"@
+}
 
 function Assert-Uia {
     if (-not $UiaAvailable) {
@@ -714,6 +760,121 @@ function Tool-Keys($ta) {
     }
 }
 
+function Tool-List($ta) {
+    Assert-Uia
+    $ref = if ($ta.PSObject.Properties['ref']) { [string]$ta.ref } else { '' }
+    $el = Resolve-Ref $ref
+    $p = $el.Current
+    $cls = [string]$p.ClassName
+    $h = [IntPtr]$p.NativeWindowHandle
+    if ($h -eq [IntPtr]::Zero) {
+        throw "element '$cls' has no HWND, so the control messages that read a self-drawn list cannot be sent to it"
+    }
+
+    $count = 0
+    $items = @()
+    $how = ''
+
+    if ($cls -eq 'SysListView32') {
+        # CROSS-PROCESS, AND THAT IS THE WHOLE PROBLEM. LVITEMW carries a POINTER to a
+        # text buffer, and the list's process cannot read a pointer into our address
+        # space: the call returns 0 and writes nothing, so the text reads back as
+        # whatever the local buffer already held - empty strings, or garbage if the
+        # offsets were also wrong. Measured on 7-Zip: the same call read "" from a
+        # buffer in this process and "电脑 / 文档 / 网络 / \\.\" from a buffer allocated
+        # in the target's.
+        #
+        # So: OpenProcess, VirtualAllocEx for the struct and for the text, send, then
+        # ReadProcessMemory the text back. Every handle is freed in finally.
+        $PROCESS_VM = 0x0008 -bor 0x0010 -bor 0x0020 -bor 0x0400  # OPERATION|READ|WRITE|QUERY
+        $MEM_COMMIT_RESERVE = 0x1000 -bor 0x2000
+        $PAGE_RW = 0x04
+        $MEM_RELEASE = 0x8000
+        $LVIF_TEXT = 1
+        $LVM_GETITEMTEXTW = 0x1073
+        $LVITEM_SIZE = [System.Runtime.InteropServices.Marshal]::SizeOf([type][ScreenboxLVITEM])
+        $TEXT_MAX = 512
+
+        $targetPid = [uint32]0
+        [Screenbox.Win32Edit]::GetWindowThreadProcessId($h, [ref]$targetPid) | Out-Null
+        if ($targetPid -eq 0) { throw 'GetWindowThreadProcessId returned 0: the window handle is not valid any more' }
+
+        $proc = [Screenbox.Win32Edit]::OpenProcess($PROCESS_VM, $false, $targetPid)
+        if ($proc -eq [IntPtr]::Zero) {
+            throw "cannot open process $targetPid for reading (try running as administrator); this is required because a list's item text lives in ITS process, not ours"
+        }
+        $remoteStruct = [IntPtr]::Zero
+        $remoteText = [IntPtr]::Zero
+        try {
+            $remoteStruct = [Screenbox.Win32Edit]::VirtualAllocEx($proc, [IntPtr]::Zero, [IntPtr]$LVITEM_SIZE, $MEM_COMMIT_RESERVE, $PAGE_RW)
+            $remoteText = [Screenbox.Win32Edit]::VirtualAllocEx($proc, [IntPtr]::Zero, [IntPtr]($TEXT_MAX * 2), $MEM_COMMIT_RESERVE, $PAGE_RW)
+            if ($remoteStruct -eq [IntPtr]::Zero -or $remoteText -eq [IntPtr]::Zero) {
+                throw 'VirtualAllocEx failed in the target process'
+            }
+
+            $count = [int][Screenbox.Win32Edit]::SendMessageInt($h, [uint32]0x1004, [IntPtr]::Zero, [IntPtr]::Zero)
+            $how = 'LVM_GETITEMTEXTW with buffers in the TARGET process (the control''s own text)'
+
+            for ($i = 0; $i -lt $count -and $i -lt 200; $i++) {
+                $lv = New-Object ScreenboxLVITEM
+                $lv.mask = $LVIF_TEXT
+                $lv.iItem = $i
+                $lv.iSubItem = 0
+                $lv.pszText = $remoteText
+                $lv.cchTextMax = $TEXT_MAX
+
+                $localBuf = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($LVITEM_SIZE)
+                try {
+                    [System.Runtime.InteropServices.Marshal]::StructureToPtr($lv, $localBuf, $false)
+                    $bytes = New-Object byte[] $LVITEM_SIZE
+                    [System.Runtime.InteropServices.Marshal]::Copy($localBuf, $bytes, 0, $LVITEM_SIZE)
+                    $written = [IntPtr]::Zero
+                    [Screenbox.Win32Edit]::WriteProcessMemory($proc, $remoteStruct, $bytes, [IntPtr]$LVITEM_SIZE, [ref]$written) | Out-Null
+                } finally { [System.Runtime.InteropServices.Marshal]::FreeHGlobal($localBuf) }
+
+                [Screenbox.Win32Edit]::SendMessageInt($h, [uint32]$LVM_GETITEMTEXTW, [IntPtr]$i, $remoteStruct) | Out-Null
+
+                $rb = New-Object byte[] ($TEXT_MAX * 2)
+                $read = [IntPtr]::Zero
+                [Screenbox.Win32Edit]::ReadProcessMemory($proc, $remoteText, $rb, [IntPtr]($TEXT_MAX * 2), [ref]$read) | Out-Null
+                $text = [System.Text.Encoding]::Unicode.GetString($rb, 0, [int]$read)
+                $nul = $text.IndexOf([char]0)
+                if ($nul -ge 0) { $text = $text.Substring(0, $nul) }
+                $items += [ordered]@{ index = $i; text = $text }
+            }
+        } finally {
+            if ($remoteStruct -ne [IntPtr]::Zero) { [Screenbox.Win32Edit]::VirtualFreeEx($proc, $remoteStruct, [IntPtr]::Zero, $MEM_RELEASE) | Out-Null }
+            if ($remoteText -ne [IntPtr]::Zero) { [Screenbox.Win32Edit]::VirtualFreeEx($proc, $remoteText, [IntPtr]::Zero, $MEM_RELEASE) | Out-Null }
+            [Screenbox.Win32Edit]::CloseHandle($proc) | Out-Null
+        }
+    }
+    elseif ($cls -eq 'ComboBox') {
+        # CB_GETCOUNT = 0x0146, CB_GETLBTEXT = 0x0148
+        $count = [int][Screenbox.Win32Edit]::SendMessageInt($h, [uint32]0x0146, [IntPtr]::Zero, [IntPtr]::Zero)
+        $how = 'CB_GETLBTEXT (the control''s own item text)'
+        $buf = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(1024)
+        try {
+            for ($i = 0; $i -lt $count -and $i -lt 200; $i++) {
+                $n = [Screenbox.Win32Edit]::SendMessageInt($h, [uint32]0x0148, [IntPtr]$i, $buf)
+                $items += [ordered]@{ index = $i; text = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($buf, [int]$n) }
+            }
+        } finally { [System.Runtime.InteropServices.Marshal]::FreeHGlobal($buf) }
+    }
+    else {
+        throw "screen_list knows how to read SysListView32 and ComboBox. '$cls' is neither, and reading it would be a guess about which messages it answers. Use screen_find for what the accessibility tree exposes."
+    }
+
+    return [ordered]@{
+        cls      = $cls
+        method   = $how
+        count    = $count
+        returned = $items.Count
+        hasMore  = ($count -gt $items.Count)
+        items    = $items
+        note     = 'these are the control''s own contents, read with its window messages. A self-drawn list reports this way and NOT through the accessibility tree, so a count here can exceed what screen_find shows.'
+    }
+}
+
 function Tool-Type($ta) {
     Assert-Uia
     $text = if ($ta.PSObject.Properties['text']) { [string]$ta.text } else { '' }
@@ -780,6 +941,9 @@ $Tools = @(
             keys = @{ type = 'string'; description = 'SendKeys syntax, e.g. ^s or %fa' }
             ref  = @{ type = 'string'; description = 'window to bring to the foreground first' } }
             required = @('keys') } }
+    @{ name = 'screen_list'
+       desc = 'Read the CONTENTS of a Win32 list control that draws its own items (SysListView32, ComboBox) using its own window messages. Use this when screen_find shows the container but no items: a virtual list (LVS_OWNERDATA) has no per-item window and is invisible to accessibility, yet answers LVM_GETITEMTEXT. Reports which message it used.'
+       schema = @{ type = 'object'; properties = @{ ref = @{ type = 'string'; description = 'h<number> or r<n.n.n>, pointing at the list control' } }; required = @('ref') } }
     @{ name = 'screen_type'
        desc = 'Type literal text into the focused element via SendKeys (reaches menus and dialogs that expose no pattern), then report the focused element fingerprint before and after.'
        schema = @{ type = 'object'; properties = @{ text = @{ type = 'string' } }; required = @('text') } }
@@ -793,6 +957,7 @@ function Invoke-Tool([string]$name, $ta) {
         'screen_act'     { return Tool-Act $ta }
         'screen_inspect' { return Tool-Inspect $ta }
         'screen_keys'     { return Tool-Keys $ta }
+        'screen_list'     { return Tool-List $ta }
         'screen_type'    { return Tool-Type $ta }
         default { throw "unknown tool '$name'" }
     }
@@ -828,7 +993,7 @@ if ($SelfTest) {
             if (-not $w) { $results += @{ tool = $name; ok = $true; bytes = 0; sample = 'skipped: no window' }; continue }
             $args = [pscustomobject]@{ ref = (Get-RefFor $w) }
         }
-        if ($name -eq 'screen_type' -or $name -eq 'screen_keys') { continue }
+        if ($name -eq 'screen_type' -or $name -eq 'screen_keys' -or $name -eq 'screen_list') { continue }
         if ($name -eq 'screen_find') { $args = [pscustomobject]@{ cls = 'Shell_TrayWnd' } }
         if ($name -eq 'screen_act') {
             # NOT the first window: the taskbar and Program Manager are top-level
