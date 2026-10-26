@@ -1399,6 +1399,109 @@ function Tool-Ocr($ta) {
     }
 }
 
+function Tool-ClickText($ta) {
+    # ONE CALL INSTEAD OF THREE. The everyday shape of GUI automation is "find the thing
+    # that says X, then click it". Before this tool that took: screen_ocr to get words,
+    # the caller reading the list and picking one, then screen_act with x/y. Three calls,
+    # and the middle one existed only to move numbers between the other two.
+    #
+    # This does the whole thing and reports each stage as a fact, so a failure says WHICH
+    # stage failed: not found, found but not clickable, clicked but nothing changed.
+    $text = if ($ta.PSObject.Properties['text']) { [string]$ta.text } else { '' }
+    if (-not $text) { throw 'screen_click_text needs text: the label to look for on screen' }
+    $exact = if ($ta.PSObject.Properties['exact']) { [bool]$ta.exact } else { $false }
+    $dryRun = if ($ta.PSObject.Properties['dryRun']) { [bool]$ta.dryRun } else { $false }
+
+    # Reuse screen_ocr by handing it the same parameters. Single implementation of the
+    # WinRT plumbing, so a fix there fixes both.
+    # BUILD A REAL OBJECT, not a hashtable. Tool-Ocr reads its arguments with
+    # $ta.PSObject.Properties['ref'], which a hashtable does not answer the same way, and
+    # dynamic member access ($ta.$k) silently yields nothing - measured: the ref was
+    # dropped and OCR ran on the whole screen instead of the window.
+    $ocrArgs = New-Object psobject
+    foreach ($k in @('ref', 'lang', 'scale', 'x', 'y', 'w', 'h')) {
+        $prop = $ta.PSObject.Properties[$k]
+        if ($prop -and $prop.Value -ne $null) {
+            $ocrArgs | Add-Member -NotePropertyName $k -NotePropertyValue $prop.Value -Force
+        }
+    }
+    $ocrResult = Tool-Ocr $ocrArgs
+
+    # MATCHING ORDER MATTERS. An exact match on a short label ("CE") must not be beaten by
+    # a longer line that merely contains it ("CE 7 8 9"), so look for equality first across
+    # all words, then fall back to containment.
+    # Whitespace is normalised because OCR inserts spaces between CJK glyphs.
+    $norm = { param($t) ($t -replace '\s+', '') }
+    $want = & $norm $text
+    $match = $null
+    $how = ''
+    foreach ($w in @($ocrResult.words)) {
+        if ((& $norm $w.text) -eq $want) { $match = $w; $how = 'exact word'; break }
+    }
+    if (-not $match) {
+        foreach ($l in @($ocrResult.lines)) {
+            if ((& $norm $l.text) -eq $want) { $match = $l; $how = 'exact line'; break }
+        }
+    }
+    if (-not $match) {
+        if ($exact) { $match = $null }
+        elseif ($ocrResult.words -ne $null) {
+            foreach ($w in @($ocrResult.words)) {
+                if ((& $norm $w.text).Contains($want)) { $match = $w; $how = 'word contains text'; break }
+            }
+        }
+    }
+    if (-not $match) {
+        if ($ocrResult.lines -ne $null) {
+            foreach ($l in @($ocrResult.lines)) {
+                if ((& $norm $l.text).Contains($want)) { $match = $l; $how = 'line contains text'; break }
+            }
+        }
+    }
+
+    if (-not $match) {
+        return [ordered]@{
+            found   = $false
+            wanted  = $text
+            region  = $ocrResult.region
+            seen    = @($ocrResult.lines | ForEach-Object { $_.text })
+            clicked = $false
+            note    = 'the text is not on screen in that region. seen lists what OCR did read, so you can tell a wrong label from a wrong region.'
+        }
+    }
+
+    if ($dryRun) {
+        return [ordered]@{
+            found   = $true
+            wanted  = $text
+            matched = $match
+            how     = $how
+            clicked = $false
+            note    = 'dryRun: located but deliberately not clicked.'
+        }
+    }
+
+    # Click through the same coordinate path screen_act uses, so FromPoint resolution,
+    # fingerprinting and verification all still apply.
+    $actArgs = New-Object psobject
+    $actArgs | Add-Member -NotePropertyName x -NotePropertyValue $match.cx
+    $actArgs | Add-Member -NotePropertyName y -NotePropertyValue $match.cy
+    $actArgs | Add-Member -NotePropertyName action -NotePropertyValue 'invoke'
+    $actResult = Tool-Act $actArgs
+
+    return [ordered]@{
+        found     = $true
+        wanted    = $text
+        matched   = $match
+        how       = $how
+        clicked   = $true
+        verified  = $actResult.verified
+        did       = $actResult.did
+        changed   = $actResult.changed
+        note      = 'found by reading pixels, clicked through the accessibility element under that point. verified:false means the click was accepted but nothing observable changed - do not retry blindly.'
+    }
+}
+
 function Tool-Wait($ta) {
     Assert-Uia
     # THE THIRD LAYER: an action plus the observation that confirms it, in one call.
@@ -1576,6 +1679,15 @@ $Tools = @(
             h     = @{ type = 'integer' }
             scale = @{ type = 'number'; description = 'upscale factor before saving (default 1). Try 2-4 for small text.' }
             path  = @{ type = 'string'; description = 'PNG path (default C:/tc/screenbox/shot.png)' } } } }
+    @{ name = 'screen_click_text'
+       desc = 'Find text on screen with OCR and click it, in one call. This is the everyday "click the thing that says X" case, and it is the only way to click a control that reports no Name and no WM_GETTEXT (owner-draw buttons, canvas UIs, unlabelled game or kiosk interfaces). Reports which stage failed: not found (with what OCR did see), found but not clicked, or clicked with verification. Use dryRun to locate without clicking.'
+       schema = @{ type = 'object'; properties = @{
+            text   = @{ type = 'string'; description = 'the label to find' }
+            ref    = @{ type = 'string'; description = 'limit the search to this element''s rectangle' }
+            exact  = @{ type = 'boolean'; description = 'require an exact match instead of a substring' }
+            dryRun = @{ type = 'boolean'; description = 'locate only, do not click' }
+            lang   = @{ type = 'string'; description = 'BCP-47 OCR language tag' }
+            scale  = @{ type = 'number'; description = 'upscale factor before OCR (default 2)' } }; required = @('text') } }
     @{ name = 'screen_wait'
        desc = 'Wait until a condition holds, then answer whether it did. Use it after an action that opens a dialog, closes a window, or fills a field: it replaces "sleep and hope" and "ask again next turn" with one call that reports the fact. Condition: appear (default), vanish, enabled, value:<text>. Returns waited_ms, and on timeout present tells you which side of the condition you are on.'
        schema = @{ type = 'object'; properties = @{
@@ -1609,6 +1721,7 @@ function Invoke-Tool([string]$name, $ta) {
         'screen_list'     { return Tool-List $ta }
         'screen_ocr'      { return Tool-Ocr $ta }
         'screen_shot'     { return Tool-Shot $ta }
+        'screen_click_text' { return Tool-ClickText $ta }
         'screen_wait'     { return Tool-Wait $ta }
         'screen_launch'   { return Tool-Launch $ta }
         'screen_type'    { return Tool-Type $ta }
@@ -1646,7 +1759,7 @@ if ($SelfTest) {
             if (-not $w) { $results += @{ tool = $name; ok = $true; bytes = 0; sample = 'skipped: no window' }; continue }
             $args = [pscustomobject]@{ ref = (Get-RefFor $w) }
         }
-        if ($name -in @('screen_type','screen_keys','screen_list','screen_wait','screen_launch','screen_ocr','screen_shot')) { continue }
+        if ($name -in @('screen_type','screen_keys','screen_list','screen_wait','screen_launch','screen_ocr','screen_shot','screen_click_text')) { continue }
         if ($name -eq 'screen_find') { $args = [pscustomobject]@{ cls = 'Shell_TrayWnd' } }
         if ($name -eq 'screen_act') {
             # NOT the first window: the taskbar and Program Manager are top-level

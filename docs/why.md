@@ -287,3 +287,38 @@ OCR 在放大后的图上跑，它给的坐标是放大图的像素。**不除�
 `screen_ocr` 给的是坐标，`screen_act` 原来只吃 ref。两者对不上，所以
 `screen_act` 增加 `x`/`y`：内部用 `AutomationElement.FromPoint` 反解出控件，
 之后的指纹、窗口跟踪、验证全部照旧。这样"看得见"和"点得着"才接上。
+
+## 一个回合只做一件事，是浪费
+
+`screen_ocr` 解决了"看得见"，但一次典型操作变成三步：
+读像素拿文字 → 调用方挑一个 → 拿坐标去点。中间那步只是搬运数字。
+
+`screen_click_text { text: "CE" }` 把三步并成一步，并且**失败时说清是哪一步失败**：
+
+```
+not found        -> seen 列出 OCR 实际读到了什么（区分"标签错"和"区域错"）
+found, not click -> dryRun 只要位置不要动作
+clicked          -> verified 说明世界有没有真的变
+```
+
+实测（计算器，CE 按钮在 UIA 里 Name 和 WM_GETTEXT 全为空）：
+
+```json
+{"found":true,"matched":{"text":"CE","cx":152,"cy":240},"how":"exact word",
+ "clicked":true,"verified":true,"did":"WM_COMMAND id=82"}
+```
+
+### PowerShell 的一个坑（值得记）
+
+把参数转交给另一个函数时，**hashtable 不顶用**：
+
+```powershell
+$args = @{}; $args['ref'] = $ta.ref    # BAD
+Tool-Ocr $args                          # Tool-Ocr 用 $ta.PSObject.Properties['ref'] 读，读不到
+```
+
+`PSObject.Properties` 对 hashtable 的回答和自定义对象不同，而 `$ta.$k` 这种动态取值
+在失败时不报错、只是得到 `$null`。后果是 `ref` 被静默丢掉，OCR 从"只扫这个窗口"
+变成"扫全屏"——不报错，只是答案错了。
+
+正确做法是 `New-Object psobject` + `Add-Member`。
