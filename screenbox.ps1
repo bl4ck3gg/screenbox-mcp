@@ -682,7 +682,7 @@ if ($SelfTest) {
             if (-not $w) { $results += @{ tool = $name; ok = $true; bytes = 0; sample = 'skipped: no window' }; continue }
             $args = [pscustomobject]@{ ref = (Get-RefFor $w) }
         }
-        if ($name -eq 'screen_type') { continue }
+        if ($name -eq 'screen_type' -or $name -eq 'screen_keys') { continue }
         if ($name -eq 'screen_find') { $args = [pscustomobject]@{ cls = 'Shell_TrayWnd' } }
         if ($name -eq 'screen_act') {
             # NOT the first window: the taskbar and Program Manager are top-level
