@@ -235,3 +235,55 @@ BoundingRectangle   -> 有值     唯一跨版本可靠的标识
 **所以对 OwnerDraw 控件，定位必须靠几何位置，不能靠 ID 常数。** 这不是能修的
 缺陷 —— 那个信息在窗口里根本不存在。工具能做的是：不假装读到了名字，让调用方
 自己用坐标判断。
+
+## WinRT OCR：像素是最后一道防线
+
+自绘控件读不到文字（见上节），但**屏幕上的像素里有字**。Windows 自带离线 OCR，
+所以这条路不需要装任何东西。
+
+### 三个 PowerShell 5.1 的陷阱（全部实测）
+
+1. **无法 await WinRT 异步**
+   `OcrEngine.RecognizeAsync` 返回 `IAsyncOperation<T>`，PowerShell 拿到的是一个
+   不可等待的对象。桥是 `System.Runtime.WindowsRuntime` 里的
+   `AsTask<T>(IAsyncOperation<T>)`，而 T 只有运行时才知道，所以必须反射：
+
+   ```powershell
+   $asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+       $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+       $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+   $task = $asTask.MakeGenericMethod($type).Invoke($null, @($op))
+   ```
+
+2. **WinRT 类型不能用 New-Object 构造**
+   必须程序集限定 + Activator：
+   ```powershell
+   [Windows.Media.Ocr.OcrEngine, Windows.Media.Ocr, ContentType = WindowsRuntime]
+   [Activator]::CreateInstance($type, @($arg))
+   ```
+
+3. **服务启动进程的 CurrentUICulture 不是桌面的语言**
+   由计划任务里的 node 拉起的 PowerShell，在中文机器上报告 `en-US`。结果 OCR
+   返回 **0 行**，而且不报错——最容易误判成"这里没字"。
+   真正的语言在注册表里：`HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language`
+   的 `InstallLanguage`（中文是 `0804`）。
+
+### 实测结果
+
+计算器（界面中文，按钮全是 OwnerDraw）：
+
+| 语言 | 识别行数 |
+|---|---|
+| `en-US` | 0 |
+| `zh-Hans-CN` | 9（含标题、菜单、MC/MR/MS/CE 及坐标） |
+
+### 坐标必须回到屏幕空间
+
+OCR 在放大后的图上跑，它给的坐标是放大图的像素。**不除以放大倍数，点击就会
+落在错误位置**——而且不会报错，只会点歪。
+
+### 顺带补的一环
+
+`screen_ocr` 给的是坐标，`screen_act` 原来只吃 ref。两者对不上，所以
+`screen_act` 增加 `x`/`y`：内部用 `AutomationElement.FromPoint` 反解出控件，
+之后的指纹、窗口跟踪、验证全部照旧。这样"看得见"和"点得着"才接上。
