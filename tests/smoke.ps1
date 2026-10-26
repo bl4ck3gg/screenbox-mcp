@@ -12,6 +12,11 @@ param()
 $ErrorActionPreference = 'Stop'
 $Script = Join-Path (Split-Path -Parent $PSScriptRoot) 'screenbox.ps1'
 
+# The interpreter to run the server under. Not "pwsh": a stock Windows Server has
+# Windows PowerShell 5.1 and no PowerShell 7, and a test that cannot run on the
+# host it is meant to check is a test that only runs in CI.
+$Interp = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
+
 function Assert-True($cond, [string]$msg) {
     if (-not $cond) { throw "FAIL: $msg" }
     Write-Host "  ok: $msg" -ForegroundColor Green
@@ -21,15 +26,16 @@ Write-Host "== screenbox smoke tests ==" -ForegroundColor Cyan
 
 # 1. -ListTools answers valid JSON with 5 tools
 Write-Host "`n1. tool catalogue"
-$raw = & pwsh -NoProfile -File $Script -ListTools
+$raw = & $Interp -NoProfile -File $Script -ListTools
 $cat = $raw | ConvertFrom-Json
-Assert-True ($cat.tools.Count -eq 5) "catalogue holds 5 tools (got $($cat.tools.Count))"
+Assert-True ($cat.tools.Count -eq 7) "catalogue holds 7 tools (got $($cat.tools.Count))"
 $names = @($cat.tools | ForEach-Object { $_.name })
 Assert-True ($names -contains 'screen_info') 'catalogue names screen_info'
 Assert-True ($names -contains 'screen_windows') 'catalogue names screen_windows'
 Assert-True ($names -contains 'screen_find') 'catalogue names screen_find'
 Assert-True ($names -contains 'screen_act') 'catalogue names screen_act'
 Assert-True ($names -contains 'screen_type') 'catalogue names screen_type'
+Assert-True ($names -contains 'screen_inspect') 'catalogue names screen_inspect'
 
 # 2. Schema check: screen_find uses procId, not pid
 $findTool = $cat.tools | Where-Object { $_.name -eq 'screen_find' }
@@ -45,7 +51,7 @@ Assert-True ($actTool.inputSchema.required -contains 'action') 'screen_act requi
 Write-Host "`n2. error paths"
 $failed = $false
 try {
-    & pwsh -NoProfile -File $Script -RunTool does_not_exist 2>&1 | Out-Null
+    & $Interp -NoProfile -File $Script -RunTool does_not_exist 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { $failed = $true }
 } catch { $failed = $true }
 Assert-True $failed 'unknown tool exits non-zero'
@@ -53,7 +59,7 @@ Assert-True $failed 'unknown tool exits non-zero'
 # 5. On Windows: run live SelfTest
 if ($IsWindows) {
     Write-Host "`n3. live Windows self-test"
-    $st = & pwsh -NoProfile -File $Script -SelfTest | ConvertFrom-Json
+    $st = & $Interp -NoProfile -File $Script -SelfTest | ConvertFrom-Json
     foreach ($r in $st.results) {
         if ($r.ok) { Write-Host "    $($r.tool): ok ($($r.bytes) B)" }
         else { Write-Host "    $($r.tool): FAIL - $($r.error)$($r.note)" -ForegroundColor Red }
@@ -61,7 +67,7 @@ if ($IsWindows) {
     # A hosted runner has no interactive desktop: screen_act has no window to act on
     # and skips itself. That is the server behaving correctly, so assert on the tools
     # that do not need a person logged in instead of on the total.
-    $info = & pwsh -NoProfile -File $Script -RunTool screen_info | ConvertFrom-Json
+    $info = & $Interp -NoProfile -File $Script -RunTool screen_info | ConvertFrom-Json
     if (-not $info.canSeeDesktop) {
         Write-Host "    note: session $($info.session) cannot see a desktop; screen_act is expected to skip" -ForegroundColor Yellow
         Assert-True ($st.passed -ge 3) "headless self-test passed $($st.passed) of $($st.total) (session $($info.session))"

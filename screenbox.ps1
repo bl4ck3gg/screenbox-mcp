@@ -70,6 +70,19 @@ if ($UiaAvailable) {
     $TS = [System.Windows.Automation.TreeScope]
 }
 
+Add-Type -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, string lParam);
+[System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "SendMessageW")]
+public static extern IntPtr SendMessageInt(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool SetForegroundWindow(IntPtr hWnd);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern IntPtr GetForegroundWindow();
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+"@ -Name "Win32Edit" -Namespace "Screenbox" -ErrorAction SilentlyContinue
+
 function Assert-Uia {
     if (-not $UiaAvailable) {
         throw 'accessibility is not available in this process. This server needs Windows with the UIAutomationClient assemblies; on another OS only -ListTools and the MCP framing work.'
@@ -308,7 +321,15 @@ function Tool-Find($ta) {
                  $parts += New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $ct) }
     if ($proc) { $parts += New-Object System.Windows.Automation.PropertyCondition($AE::ProcessIdProperty, $proc) }
     if ($parts.Count -eq 0) {
-        throw 'screen_find needs at least one selector (cls, aid, name, type, procId). An unfiltered search walks the whole desktop, which is the cost this server exists to avoid; use screen_windows for "what is there".'
+        # `under` ALONE IS A LEGITIMATE QUESTION, and refusing it was wrong: "what is
+        # inside this window" is the commonest thing an agent asks, and it is bounded
+        # by the container the caller named. What must stay refused is a search with
+        # no bound at all - that walks the whole desktop, which is the cost this
+        # server exists to avoid.
+        if (-not $under) {
+            throw 'screen_find needs a bound: at least one selector (cls, aid, name, type, procId), or under <ref> to ask "what is inside this element". An unbounded search walks the whole desktop; use screen_windows for "what is on the desktop".'
+        }
+        $parts += [System.Windows.Automation.Condition]::TrueCondition
     }
     $cond = if ($parts.Count -eq 1) { $parts[0] } else { New-Object System.Windows.Automation.AndCondition($parts) }
     $scope = if ($top) { $TS::Children } else { $TS::Descendants }
@@ -362,8 +383,33 @@ function Tool-Act($ta) {
             $did = 'SetFocus'
         }
         '^setvalue:(?<v>[\s\S]*)$' {
-            $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Matches['v'])
-            $did = 'ValuePattern.SetValue'
+            $val = $Matches['v']
+            $worked = $false
+            try {
+                $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+                $vp.SetValue($val)
+                $did = 'ValuePattern.SetValue'
+                $worked = $true
+            } catch { }
+            if (-not $worked) {
+                # A classic Win32 Edit (Notepad, common dialogs) implements NO pattern
+                # at all, so SetValue throws Unsupported Pattern. Send WM_SETTEXT directly
+                # when the element has an HWND: that is what the control actually speaks.
+                $h = [IntPtr]$el.Current.NativeWindowHandle
+                if ($h -ne [IntPtr]::Zero) {
+                    [Screenbox.Win32Edit]::SendMessage($h, [uint32]0x000C, [IntPtr]::Zero, $val)
+                    # MARK IT DIRTY, or the application does not know it changed: Notepad
+                    # keeps its own "modified" flag, WM_SETTEXT does not set it, and the
+                    # Save item stays greyed out - Ctrl+S does nothing, no dialog appears,
+                    # and the caller concludes the save worked. EM_SETMODIFY is what
+                    # typing would have done.
+                    [Screenbox.Win32Edit]::SendMessageInt($h, [uint32]0x00B9, [IntPtr]1, [IntPtr]::Zero) | Out-Null
+                    $did = 'WM_SETTEXT + EM_SETMODIFY (Win32 fallback: element implements no ValuePattern)'
+                    $worked = $true
+                } else {
+                    throw "element exposes no ValuePattern and has no HWND to send text to"
+                }
+            }
         }
         '^window:maximize$' { $el.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).SetWindowVisualState('Maximized'); $did = 'WindowPattern.Maximize' }
         '^window:minimize$' { $el.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).SetWindowVisualState('Minimized'); $did = 'WindowPattern.Minimize' }
@@ -390,6 +436,136 @@ function Tool-Act($ta) {
         before         = $before
         after          = $after
         interpretation = $verdict
+    }
+}
+
+function Tool-Inspect($ta) {
+    Assert-Uia
+    $ref = if ($ta.PSObject.Properties['ref']) { [string]$ta.ref } else { '' }
+    $el = Resolve-Ref $ref
+    $p = $el.Current
+    $r = $p.BoundingRectangle
+
+    $patterns = @()
+    try {
+        foreach ($pt in $el.GetSupportedPatterns()) {
+            $patterns += ([string]$pt.ProgrammaticName -replace '^Pattern$', '' -replace 'Pattern$', '')
+        }
+    } catch { }
+
+    $state = Get-State $el
+    return [ordered]@{
+        ref      = Get-RefFor $el
+        name     = [string]$p.Name
+        cls      = [string]$p.ClassName
+        aid      = [string]$p.AutomationId
+        pid      = [int]$p.ProcessId
+        rect     = @((Num $r.X), (Num $r.Y), (Num $r.Width), (Num $r.Height))
+        patterns = $patterns
+        state    = $state
+        children = (Count-Subtree $el 60).count
+    }
+}
+
+function Tool-Keys($ta) {
+    Assert-Uia
+    $keys = if ($ta.PSObject.Properties['keys']) { [string]$ta.keys } else { '' }
+    if ([string]::IsNullOrEmpty($keys)) { throw 'screen_keys needs keys, in SendKeys syntax: ^s (ctrl+s), %f (alt+f), {ENTER}, {TAB}, {ESC}' }
+    $target = if ($ta.PSObject.Properties['ref']) { [string]$ta.ref } else { '' }
+
+    # NO ESCAPING HERE, and that is the difference from screen_type: screen_type takes
+    # TEXT, where ^ and % are characters to type. This takes KEYS, where they are
+    # modifiers. A menu is reachable only this way - a Win32 menu bar is not in the
+    # accessibility tree, so %f is the only way to open File.
+    if ($target) {
+        try {
+            $el = Resolve-Ref $target
+            $h = [IntPtr]$el.Current.NativeWindowHandle
+            if ($h -ne [IntPtr]::Zero) { [Screenbox.Win32Edit]::SetForegroundWindow($h) | Out-Null }
+            else { $el.SetFocus() }
+            Start-Sleep -Milliseconds 250
+        } catch { }
+    }
+    $before = 0
+    try { $before = (Count-Subtree $AE::RootElement 60).count } catch { }
+    $topsBefore = 0
+    try { $topsBefore = $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition).Count } catch { }
+
+        # keybd_event INSTEAD OF SendWait. SendWait installs a journal hook, which
+    # fails with "Access is denied" whenever an RDP desktop is running without an
+    # active viewer (the console session). keybd_event writes into the raw input
+    # queue and needs no hook, so it works under an unattended session.
+    function Send-Chord([string]$spec) {
+        $VK_CONTROL = 0x11
+        $VK_MENU    = 0x12  # Alt
+        $VK_SHIFT   = 0x10
+        $VK_RETURN  = 0x0D
+        $VK_ESCAPE  = 0x1B
+        $VK_TAB     = 0x09
+        $KEYEVENTF_KEYUP = [uint32]2
+
+        $ctrl = $spec.StartsWith('^')
+        $alt  = $spec.StartsWith('%')
+        $tail = $spec
+        if ($ctrl -or $alt) { $tail = $spec.Substring(1) }
+
+        if ($ctrl) { [Screenbox.Win32Edit]::keybd_event([byte]$VK_CONTROL, 0, 0, [UIntPtr]::Zero) }
+        if ($alt)  { [Screenbox.Win32Edit]::keybd_event([byte]$VK_MENU, 0, 0, [UIntPtr]::Zero) }
+
+        # map common named keys or characters
+        $vk = 0
+        switch ($tail.ToLower()) {
+            '{enter}'  { $vk = $VK_RETURN }
+            '{esc}'    { $vk = $VK_ESCAPE }
+            '{tab}'    { $vk = $VK_TAB }
+            default {
+                if ($tail.Length -eq 1) {
+                    $c = [char]$tail.ToUpper()
+                    $vk = [byte][int]$c
+                }
+            }
+        }
+        if ($vk -ne 0) {
+            [Screenbox.Win32Edit]::keybd_event([byte]$vk, 0, 0, [UIntPtr]::Zero)
+            Start-Sleep -Milliseconds 80
+            [Screenbox.Win32Edit]::keybd_event([byte]$vk, 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+        }
+        if ($alt)  { [Screenbox.Win32Edit]::keybd_event([byte]$VK_MENU, 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero) }
+        if ($ctrl) { [Screenbox.Win32Edit]::keybd_event([byte]$VK_CONTROL, 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero) }
+    }
+    Send-Chord $keys
+    Start-Sleep -Milliseconds 600
+
+    # DID THE KEYS HAVE ANYWHERE TO GO? On a disconnected RDP session there is no
+    # foreground window at all: SetForegroundWindow returns false, GetForegroundWindow
+    # returns 0, and keybd_event writes into a queue nobody reads. Key injection then
+    # "succeeds" and changes nothing, which is the failure this server exists to name.
+    $fgNote = ''
+    try {
+        $fg = [Screenbox.Win32Edit]::GetForegroundWindow()
+        if ($fg -eq [IntPtr]::Zero) {
+            $fgNote = 'NO FOREGROUND WINDOW: this desktop has no active viewer (a disconnected RDP session does this). Keys go into a queue nothing reads, so their effect is unobservable and the action should be treated as NOT done. Connect to the desktop, or drive the app through patterns instead of keys.'
+        }
+    } catch { }
+
+    $topsAfter = 0
+    try { $topsAfter = $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition).Count } catch { }
+    $windows = @()
+    try {
+        foreach ($w in $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)) {
+            $windows += (Get-Brief $w)
+        }
+    } catch { }
+    $realNote = if ($fgNote) { $fgNote } else {
+        'a dialog that this key opened is in the list above; its ref can be used immediately'
+    }
+    return [ordered]@{
+        sent           = $keys
+        topWindows     = $topsBefore.ToString() + ' -> ' + $topsAfter.ToString()
+        windowAppeared = ($topsAfter -gt $topsBefore)
+        foreground     = $fgNote -eq ''
+        windows        = $windows
+        note           = $realNote
     }
 }
 
@@ -449,6 +625,15 @@ $Tools = @(
             ref    = @{ type = 'string'; description = 'h<number> or r<n.n.n>' }
             action = @{ type = 'string'; description = 'invoke | default | toggle | expand | collapse | select | focus | setvalue:<text> | window:maximize | window:minimize | window:close' } }
             required = @('ref', 'action') } }
+    @{ name = 'screen_inspect'
+       desc = 'Read one element without acting on it: its observable state (value, text, toggle, selected, expanded), the list of patterns it supports, and its child count. Use this to confirm what an element currently says, or to find out which action it will accept before trying one.'
+       schema = @{ type = 'object'; properties = @{ ref = @{ type = 'string'; description = 'h<number> or r<n.n.n>' } }; required = @('ref') } }
+    @{ name = 'screen_keys'
+       desc = 'Send a key sequence in SendKeys syntax: ^s ctrl+s, %f alt+f, {ENTER}, {TAB}, {ESC}. Unlike screen_type this does NOT escape, so modifiers work - which is the only way to reach a Win32 menu bar, since menus are not in the accessibility tree. Optional ref brings that window to the foreground first. Answers the top-level window list after the keys, so a dialog it opened is visible in the same reply.'
+       schema = @{ type = 'object'; properties = @{
+            keys = @{ type = 'string'; description = 'SendKeys syntax, e.g. ^s or %fa' }
+            ref  = @{ type = 'string'; description = 'window to bring to the foreground first' } }
+            required = @('keys') } }
     @{ name = 'screen_type'
        desc = 'Type literal text into the focused element via SendKeys (reaches menus and dialogs that expose no pattern), then report the focused element fingerprint before and after.'
        schema = @{ type = 'object'; properties = @{ text = @{ type = 'string' } }; required = @('text') } }
@@ -460,6 +645,8 @@ function Invoke-Tool([string]$name, $ta) {
         'screen_windows' { return Tool-Windows }
         'screen_find'    { return Tool-Find $ta }
         'screen_act'     { return Tool-Act $ta }
+        'screen_inspect' { return Tool-Inspect $ta }
+        'screen_keys'     { return Tool-Keys $ta }
         'screen_type'    { return Tool-Type $ta }
         default { throw "unknown tool '$name'" }
     }
@@ -486,6 +673,15 @@ if ($SelfTest) {
     foreach ($t in $Tools) {
         $name = $t.name
         $args = [pscustomobject]@{}
+        if ($name -eq 'screen_inspect') {
+            $w = $null
+            try {
+                $all = $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)
+                if ($all.Count -gt 0) { $w = $all[0] }
+            } catch { }
+            if (-not $w) { $results += @{ tool = $name; ok = $true; bytes = 0; sample = 'skipped: no window' }; continue }
+            $args = [pscustomobject]@{ ref = (Get-RefFor $w) }
+        }
         if ($name -eq 'screen_type') { continue }
         if ($name -eq 'screen_find') { $args = [pscustomobject]@{ cls = 'Shell_TrayWnd' } }
         if ($name -eq 'screen_act') {
