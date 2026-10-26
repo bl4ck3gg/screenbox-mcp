@@ -216,3 +216,22 @@ carries the meaning.
 - **No caching of elements across calls.** See the ref section: a cached handle
   is a stale handle, and a stale handle that still resolves is worse than one
   that fails.
+
+## 自绘控件的天花板
+
+Win32 计算器的按钮是 OwnerDraw（`BS_OWNERDRAW`）：按钮自己不存文本，父窗口在
+`WM_DRAWITEM` 里直接画字。后果是三条读文字的路径全部为空：
+
+```
+UIA  Current.Name   -> ""      控件没有 window text
+WM_GETTEXT          -> ""      同上
+AutomationId        -> 有数字   但不同 Windows 版本的顺序不同
+BoundingRectangle   -> 有值     唯一跨版本可靠的标识
+```
+
+实测代价：按 `aid=94` 以为是加号，实际是减号，算出来 `7 - 8 = -1` 而不是 15。
+`aid=93` 才是加号。
+
+**所以对 OwnerDraw 控件，定位必须靠几何位置，不能靠 ID 常数。** 这不是能修的
+缺陷 —— 那个信息在窗口里根本不存在。工具能做的是：不假装读到了名字，让调用方
+自己用坐标判断。
